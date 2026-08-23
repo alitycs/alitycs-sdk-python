@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "alitycs"
+version = "1.0.0"
+description = "Official Alitycs analytics SDK for Python servers"
+readme = "README.md"
+requires-python = ">=3.9"
+keywords = ["analytics", "alitycs", "events", "telemetry"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Logging",
+]
+# Zero runtime dependencies by design: HTTP uses urllib.request from the stdlib,
+# mirroring how alitycs-sdk-jvm uses java.net.http.
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/alitycs"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "scripts", "README.md", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.coverage.run]
+branch = true
+source = ["alitycs"]
+
+[tool.coverage.report]
+# coverage.py has no function-coverage metric, so the contract's "functions >= 85%"
+# gate is covered by branch coverage instead (see .agents/plans/sdk-python.md).
+# scripts/coverage_gate.py additionally enforces the branch gate from coverage.json.
+fail_under = 90
+show_missing = true

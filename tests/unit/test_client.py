@@ -1,0 +1,293 @@
+"""Unit tests for the :class:`Alitycs` client and its module-level convenience API."""
+
+from __future__ import annotations
+
+import threading
+from typing import Any, Dict
+
+import pytest
+
+from alitycs import Alitycs, RevenuePayload, get_default_instance, init
+from alitycs import (
+    capture_error as mod_capture_error,
+)
+from alitycs import (
+    flush as mod_flush,
+)
+from alitycs import (
+    identify as mod_identify,
+)
+from alitycs import (
+    page as mod_page,
+)
+from alitycs import (
+    reset as mod_reset,
+)
+from alitycs import (
+    set_global_properties as mod_set_global_properties,
+)
+from alitycs import (
+    shutdown as mod_shutdown,
+)
+from alitycs import (
+    track as mod_track,
+)
+from alitycs import (
+    track_revenue as mod_track_revenue,
+)
+from tests.conftest import CaptureServer
+
+
+@pytest.fixture()
+def client(capture_server) -> Alitycs:
+    instance = Alitycs(
+        api_key="pk_unit",
+        endpoint=capture_server.url,
+        flush_size=100,  # nothing dispatches unless a test flushes explicitly
+        flush_interval=None,
+    )
+    yield instance
+    instance.shutdown(join_timeout=2.0)
+
+
+def drain(server: CaptureServer, count: int, timeout: float = 5.0) -> bool:
+    return server.wait_for_event_count(count, timeout)
+
+
+class TestInstanceBasics:
+    def test_config_and_pending_properties(self, client):
+        assert client.config.api_key == "pk_unit"
+        assert client.pending == 0
+        client.track("pending_check")
+        assert client.pending == 1
+
+    def test_blank_event_names_are_ignored(self, client, capture_server):
+        client.track("")
+        client.track("   ")
+        client.capture_error("")
+        assert client.flush()
+        assert capture_server.requests == []
+
+    def test_blank_user_id_is_ignored(self, client, capture_server):
+        client.identify("   ")
+        assert client.flush()
+        assert capture_server.requests == []
+
+    def test_page_defaults_to_page_view_when_unnamed(self, client, capture_server):
+        client.page(None, {"screen": "settings"})
+        client.page("  ")
+        assert client.flush()
+        assert drain(capture_server, 2)
+        assert capture_server.event_names == ["page_view", "page_view"]
+        assert capture_server.events[0]["eventType"] == "page"
+        assert capture_server.events[0]["properties"] == {"screen": "settings"}
+
+    def test_reset_forgets_identified_user(self, client, capture_server):
+        client.identify("usr_x")
+        client.reset()
+        client.track("after_reset")
+        assert client.flush()
+
+        after = capture_server.events[-1]
+        assert "userId" not in after
+
+    def test_set_global_properties_merge_into_every_later_event(self, client, capture_server):
+        client.set_global_properties({"env": "prod"})
+        client.set_global_properties({"region": "eu"})
+        client.track("with_globals")
+        assert client.flush()
+
+        event = capture_server.events[0]
+        assert event["properties"]["env"] == "prod"
+        assert event["properties"]["region"] == "eu"
+
+    def test_track_revenue_requires_a_revenue_payload(self, client, capture_server):
+        with pytest.raises(TypeError, match="RevenuePayload"):
+            client.track_revenue({"kind": "transaction", "amount": "1.00"})  # type: ignore[arg-type]
+        assert client.flush()
+        assert capture_server.requests == []
+
+    def test_flush_returns_true_without_batching(self, capture_server):
+        client = Alitycs(
+            api_key="pk_unit", endpoint=capture_server.url, flush_size=10, flush_interval=None, batching=False
+        )
+        client.track("inline_1")
+        assert drain(capture_server, 1)
+        assert client.flush() is True
+        assert client.pending == 0
+        client.shutdown(join_timeout=2.0)
+
+    def test_inline_send_swallows_failures(self, capture_factory):
+        server = capture_factory(responder=lambda request: 500)
+        client = Alitycs(
+            api_key="pk_unit",
+            endpoint=server.url,
+            flush_size=10,
+            flush_interval=None,
+            batching=False,
+            max_retries=0,
+            retry_backoff_base=0.0,
+        )
+        client.track("inline_doomed")  # must not raise despite the 500
+        client.shutdown(join_timeout=2.0)
+
+    def test_queue_full_drops_events_without_raising(self, capture_server):
+        client = Alitycs(
+            api_key="pk_unit",
+            endpoint=capture_server.url,
+            flush_size=100,
+            flush_interval=None,
+            max_queue_size=2,
+        )
+        client.track("q1")
+        client.track("q2")
+        client.track("q3")  # over the cap: dropped silently
+        assert client.flush()
+        assert sorted(capture_server.event_names) == ["q1", "q2"]
+        client.shutdown(join_timeout=2.0)
+
+
+class TestModuleLevelApi:
+    """The ``alitycs.<fn>`` convenience wrappers over the default instance."""
+
+    @pytest.fixture()
+    def sdk(self, capture_server):
+        instance = init(
+            "pk_module",
+            endpoint=capture_server.url,
+            flush_size=100,
+            flush_interval=None,
+        )
+        yield instance
+        mod_shutdown()
+
+    def test_init_installs_the_default_instance(self, sdk):
+        assert get_default_instance() is sdk
+
+    def test_convenience_calls_delegate(self, capture_server, sdk):
+        revenue = RevenuePayload.transaction(fact_id="f", amount="19.99", currency="USD")
+
+        mod_track("mod_track", {"n": 1})
+        mod_capture_error("mod_error")
+        mod_track_revenue(revenue)
+        mod_identify("usr_mod", {"plan": "pro"})
+        mod_page("ModPage")
+        mod_set_global_properties({"suite": "unit"})
+        mod_track("mod_after_globals")
+
+        assert mod_flush()
+        assert drain(capture_server, 6)
+
+        names = capture_server.event_names
+        assert names[:5] == ["mod_track", "mod_error", "revenue_transaction", "identify", "ModPage"]
+        after_globals = capture_server.events[-1]
+        assert after_globals["properties"]["suite"] == "unit"
+
+    def test_reset_and_shutdown_via_module_functions(self, capture_server, sdk):
+        mod_identify("usr_bye")
+        mod_reset()
+        mod_track("post_mod_reset")
+        assert mod_flush()
+
+        post = capture_server.events[-1]
+        assert "userId" not in post
+        mod_shutdown()
+        assert get_default_instance() is None
+
+    def test_calls_before_init_are_no_ops(self):
+        mod_shutdown()
+        assert mod_flush() is True
+        mod_track("never_sent")  # must not raise
+
+
+class TestProcessHooks:
+    def test_atexit_handler_shuts_down_live_instances(self, capture_server):
+        from alitycs.client import _shutdown_all_at_exit
+
+        client = Alitycs(api_key="pk_exit", endpoint=capture_server.url, flush_size=100, flush_interval=None)
+        client.track("atexit_drain")
+        _shutdown_all_at_exit()  # what the registered atexit hook calls
+        assert drain(capture_server, 1)
+        assert client.pending == 0
+
+    def test_atexit_handler_survives_broken_instances(self):
+        from alitycs.client import _shutdown_all_at_exit
+
+        class Broken:
+            def shutdown(self) -> None:
+                raise RuntimeError("boom")
+
+        broken = Broken()  # held by a local so the weakref target stays alive
+        import alitycs.client as client_module
+
+        sentinel = set(client_module._LIVE_INSTANCES)  # keep existing members untouched
+        try:
+            client_module._LIVE_INSTANCES.clear()
+            client_module._LIVE_INSTANCES.add(broken)  # type: ignore[arg-type]
+            _shutdown_all_at_exit()  # must not raise
+        finally:
+            client_module._LIVE_INSTANCES.clear()
+            client_module._LIVE_INSTANCES.update(sentinel)
+
+    def test_fork_child_resets_thread_state(self, capture_server):
+        """Simulate the os.register_at_fork child hook: locks replaced, worker forgotten."""
+        # No event has been tracked yet, so no flusher thread exists — exactly the
+        # state a freshly forked child observes (it inherits no running threads).
+        client = Alitycs(api_key="pk_fork", endpoint=capture_server.url, flush_size=100, flush_interval=None)
+        assert client.pending == 0
+        client._reset_for_child()
+
+        # The child can enqueue and deliver again through a fresh worker.
+        client.track("post_fork")
+        assert client.flush()
+        assert drain(capture_server, 1)
+        client.shutdown(join_timeout=2.0)
+
+
+class TestBatchManagerEdges:
+    @staticmethod
+    def _event():
+        from alitycs.types import AnalyticsEvent, EventContext, EventType
+
+        return AnalyticsEvent(
+            event_id="evt_1",
+            event="x",
+            event_type=EventType.TRACK,
+            anonymous_id="anon",
+            session_id="sess",
+            timestamp=1,
+            properties={},
+            context=EventContext(sdk_version="1.0.0", sdk_language="python"),
+        )
+
+    def test_add_is_rejected_after_shutdown(self):
+        from alitycs.batch import BatchManager
+
+        sent: List[Dict[str, Any]] = []
+        manager = BatchManager(flush_size=1, flush_interval=None, max_queue_size=5, send_fn=sent.append)
+        event = self._event()
+        manager.add(event)
+        assert manager.flush(timeout=2.0)
+        manager.shutdown(join_timeout=2.0)
+        assert manager.add(event) is False  # closed: dropped, not raised
+
+    def test_flush_timeout_returns_false_while_a_send_is_in_flight(self):
+        from alitycs.batch import BatchManager
+
+        release = threading.Event()
+        started = threading.Event()
+
+        def slow_send(payload: Any) -> None:
+            started.set()
+            release.wait(5.0)
+
+        manager = BatchManager(flush_size=1, flush_interval=None, max_queue_size=5, send_fn=slow_send)
+        manager.add(self._event())
+        assert started.wait(2.0)
+
+        # The deadline elapses while the only send is still in flight…
+        assert manager.flush(timeout=0.2) is False
+        # …and once it lands, a follow-up flush drains clean.
+        release.set()
+        assert manager.flush(timeout=2.0) is True
+        manager.shutdown(join_timeout=2.0)
