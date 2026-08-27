@@ -1,6 +1,8 @@
+import time
+from email.utils import formatdate
 from typing import List, Optional
 
-from alitycs.transport import HttpTransport
+from alitycs.transport import HttpTransport, SendFailed, SendRejected, SendSuccess, parse_retry_after
 from alitycs.types import AnalyticsEvent, BatchPayload, EventContext, EventType
 from tests.conftest import CaptureServer
 
@@ -64,26 +66,89 @@ def test_backoff_is_capped_at_ten_seconds(capture_factory):
     assert sleeps == [8.0, 10.0, 10.0]
 
 
-def test_client_errors_are_not_retried(capture_factory):
+def test_client_errors_are_not_retried_and_reported_as_rejections(capture_factory):
     server = capture_factory(responder=lambda request: 422)
     transport = make_transport(server, max_retries=5)
-    transport.send(make_payload())
+    outcome = transport.send(make_payload())
     assert len(server.requests) == 1
+    assert isinstance(outcome, SendRejected)
+    assert outcome.status == 422
+    assert outcome.is_batch_reject is False
+
+
+def test_400_is_reported_as_a_whole_batch_rejection(capture_factory):
+    server = capture_factory(responder=lambda request: 400)
+    transport = make_transport(server, max_retries=5)
+    outcome = transport.send(make_payload())
+    assert isinstance(outcome, SendRejected)
+    assert outcome.is_batch_reject is True
 
 
 def test_429_is_retried(capture_factory):
     statuses = iter([429, 202])
     server = capture_factory(responder=lambda request: next(statuses))
     transport = make_transport(server, max_retries=2)
-    transport.send(make_payload())
+    outcome = transport.send(make_payload())
     assert [request["status"] for request in server.requests] == [429, 202]
+    assert isinstance(outcome, SendSuccess)
+
+
+def test_429_retry_after_seconds_is_honoured(capture_factory):
+    """A structured Retry-After replaces the default backoff for the next attempt."""
+    responses = iter([(429, {"Retry-After": "2"}), 202])
+    server = capture_factory(responder=lambda request: next(responses))
+    sleeps: List[float] = []
+    transport = make_transport(server, sleeps=sleeps, max_retries=1)
+    transport.send(make_payload())
+
+    assert [request["status"] for request in server.requests] == [429, 202]
+    # Even with retry_backoff_base=0 (the make_transport default) the wait is the
+    # full server-suggested 2s.
+    assert sleeps == [2.0]
+
+
+def test_429_retry_after_http_date_is_honoured(capture_factory):
+    responses = iter([(429, {"Retry-After": formatdate(time.time() + 3, usegmt=True)}), 202])
+    server = capture_factory(responder=lambda request: next(responses))
+    sleeps: List[float] = []
+    transport = make_transport(server, sleeps=sleeps, max_retries=1)
+    transport.send(make_payload())
+
+    assert [request["status"] for request in server.requests] == [429, 202]
+    # Wall time passes between the header being formatted and parsed; the default
+    # backoff here is 0s, so anything well above that proves the date was honoured.
+    assert 2.0 <= sleeps[0] <= 3.0
+
+
+def test_429_retry_after_is_capped_at_ten_seconds(capture_factory):
+    responses = iter([(429, {"Retry-After": "3600"}), 202])
+    server = capture_factory(responder=lambda request: next(responses))
+    sleeps: List[float] = []
+    transport = make_transport(server, sleeps=sleeps, max_retries=1)
+    transport.send(make_payload())
+
+    assert sleeps == [10.0]
+
+
+def test_parse_retry_after_variants():
+    assert parse_retry_after({"Retry-After": "5"}) == 5.0
+    assert parse_retry_after({"Retry-After": " 120 "}) == 120.0
+    assert parse_retry_after({}) is None
+    assert parse_retry_after(None) is None
+    assert parse_retry_after({"Retry-After": "soon"}) is None
+    # A date in the past clamps to zero instead of going negative.
+    past = formatdate(time.time() - 60, usegmt=True)
+    assert parse_retry_after({"Retry-After": past}) == 0.0
+    future = formatdate(time.time() + 30, usegmt=True)
+    assert 28.0 <= parse_retry_after({"Retry-After": future}) <= 30.0
 
 
 def test_exhausted_retries_drop_the_batch_without_raising(capture_factory):
     server = capture_factory(responder=lambda request: 500)
     transport = make_transport(server)
-    transport.send(make_payload())  # must not raise
+    outcome = transport.send(make_payload())  # must not raise
     assert len(server.requests) == 3  # initial + two retries
+    assert isinstance(outcome, SendFailed)
 
 
 def test_network_failure_is_retried_then_dropped():
@@ -95,7 +160,8 @@ def test_network_failure_is_retried_then_dropped():
         retry_backoff_base=0.0,
         sleep=lambda seconds: None,
     )
-    transport.send(make_payload())  # must not raise
+    outcome = transport.send(make_payload())  # must not raise
+    assert isinstance(outcome, SendFailed)
 
 
 def test_debug_logging_on_exhaustion(capture_factory, capsys):
@@ -107,9 +173,12 @@ def test_debug_logging_on_exhaustion(capture_factory, capsys):
     assert "[Alitycs]" in captured.err
 
 
-def test_no_logging_when_debug_disabled(capture_factory, capsys):
+def test_final_failures_are_warned_even_when_debug_is_disabled(capture_factory, capsys):
+    """Delivery failures are never silent: dropped batches must be visible without
+    opting into debug logging."""
     server = capture_factory(responder=lambda request: 400)
     transport = make_transport(server)
     transport.send(make_payload())
     captured = capsys.readouterr()
-    assert captured.err == ""
+    assert "WARN" in captured.err
+    assert "not retrying" in captured.err

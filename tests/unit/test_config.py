@@ -60,3 +60,33 @@ def test_flush_interval_must_be_positive_or_none():
     with pytest.raises(ValueError, match="flush_interval"):
         AlitycsConfig(api_key="pk", flush_interval=-1.0)
     assert AlitycsConfig(api_key="pk", flush_interval=None).flush_interval is None
+
+
+@pytest.mark.parametrize("field", ["request_timeout", "retry_backoff_base", "session_timeout"])
+def test_positive_number_fields_validated(field):
+    for bad in (0, -1.0, True, "10", None, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match=field):
+            AlitycsConfig(api_key="pk", **{field: bad})
+    assert AlitycsConfig(api_key="pk", **{field: 0.5}) is not None
+
+
+def test_request_timeout_none_rejected():
+    """None would hand urlopen(timeout=None) an unbounded request."""
+    with pytest.raises(ValueError, match="request_timeout"):
+        AlitycsConfig(api_key="pk", request_timeout=None)
+
+
+def test_repr_masks_api_key():
+    config = AlitycsConfig(api_key="pk_secret_abc123")
+    text = repr(config)
+    assert "pk_secret_abc123" not in text
+    assert "…c123" in text
+    # The other fields stay inspectable.
+    assert "endpoint" in text
+
+
+def test_repr_masks_short_api_key():
+    config = AlitycsConfig(api_key="short")
+    text = repr(config)
+    assert "short" not in text
+    assert "…hort" in text

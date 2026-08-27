@@ -4,17 +4,24 @@ from __future__ import annotations
 
 import atexit
 import os
+import signal
 import threading
-import weakref
 from typing import Any, Dict, Mapping, Optional
 
 from .batch import BatchManager
 from .config import DEFAULT_ENDPOINT, AlitycsConfig
 from .context import collect_context
 from .session import SessionManager
-from .transport import HttpTransport
+from .transport import HttpTransport, SendFailed, SendRejected
 from .types import AnalyticsEvent, BatchPayload, EventType, RevenuePayload
-from .utils import debug_warn, generate_id, now_ms, serialize_properties
+from .utils import (
+    EventRejectedError,
+    generate_id,
+    now_ms,
+    serialize_properties,
+    validate_event,
+    warn,
+)
 
 __version__ = "1.0.0"
 
@@ -81,6 +88,7 @@ class Alitycs:
         self._identity_lock = threading.RLock()
         self._user_id: Optional[str] = None
         self._global_properties: Dict[str, Any] = {}
+        self._rejected_locally_count = 0
         _LIVE_INSTANCES.add(self)
 
     @property
@@ -88,11 +96,23 @@ class Alitycs:
         return self._config
 
     @property
+    def is_shutdown(self) -> bool:
+        """True once :meth:`shutdown` has run; a shut-down client accepts no events."""
+        return self._batch_manager is not None and self._batch_manager.closed
+
+    @property
     def pending(self) -> int:
         """Events not yet delivered: queued plus in an in-flight send."""
         if self._batch_manager is None:
             return 0
         return self._batch_manager.pending
+
+    @property
+    def rejected_locally(self) -> int:
+        """Events rejected at build time for violating ingestion limits (also logged
+        at warn level when they happen)."""
+        with self._identity_lock:
+            return self._rejected_locally_count
 
     def track(
         self,
@@ -183,8 +203,9 @@ class Alitycs:
             self._global_properties.update(dict(properties))
 
     def flush(self, timeout: Optional[float] = None) -> bool:
-        """Send everything queued and wait for in-flight sends. Returns ``False`` only
-        when a ``timeout`` was given and elapsed before the drain finished."""
+        """Send everything queued and wait for in-flight sends. Returns ``True`` only
+        when every event was delivered; ``False`` when a send failed (survivors stay
+        queued for a later flush) or a ``timeout`` was given and elapsed first."""
         if self._batch_manager is None:
             return True
         return self._batch_manager.flush(timeout)
@@ -213,33 +234,42 @@ class Alitycs:
         if properties:
             merged.update(properties)
 
-        event = AnalyticsEvent(
-            event_id=f"evt_{generate_id()}",
-            event=name,
-            event_type=event_type,
-            user_id=effective_user,
-            anonymous_id=session.anonymous_id,
-            session_id=session.id,
-            timestamp=timestamp if timestamp is not None else now_ms(),
-            properties=serialize_properties(merged),
-            revenue=revenue,
-            context=collect_context(__version__),
-        )
+        try:
+            event = AnalyticsEvent(
+                event_id=f"evt_{generate_id()}",
+                event=name,
+                event_type=event_type,
+                user_id=effective_user,
+                anonymous_id=session.anonymous_id,
+                session_id=session.id,
+                timestamp=timestamp if timestamp is not None else now_ms(),
+                properties=serialize_properties(merged),
+                revenue=revenue,
+                context=collect_context(__version__),
+            )
+            validate_event(event)
+        except EventRejectedError as exc:
+            # Rejected locally: never queued, never sent (the server would refuse the
+            # whole batch). Surfaced at warn level and counted, never truncated.
+            with self._identity_lock:
+                self._rejected_locally_count += 1
+            warn(str(exc))
+            return
 
         if self._batch_manager is not None:
             self._batch_manager.add(event)
         else:
-            # Batching disabled: deliver inline, still best-effort.
+            # Batching disabled: deliver inline; failures are reported, not hidden.
             payload = BatchPayload(
                 batch_id=f"batch_{generate_id()}",
                 sent_at=now_ms(),
                 events=[event],
             )
-            try:
-                self._transport.send(payload)
-            except Exception as exc:  # noqa: BLE001 - analytics must never break the host
-                if self._config.debug:
-                    debug_warn(f"Batch send failed — events dropped ({exc})")
+            outcome = self._transport.send(payload)
+            if isinstance(outcome, SendRejected):
+                warn(f"Server rejected event {event.event_id} with HTTP {outcome.status}")
+            elif isinstance(outcome, SendFailed):
+                warn(f"Transport failure ({outcome.reason}) — event {event.event_id} not delivered")
 
     def _reset_for_child(self) -> None:
         """Post-fork repair in the child process: drop inherited locks and forget the
@@ -252,7 +282,11 @@ class Alitycs:
 # Module-level convenience API over a default instance ----------------------------
 
 _default_instance: Optional[Alitycs] = None
-_LIVE_INSTANCES: "weakref.WeakSet[Alitycs]" = weakref.WeakSet()
+# Strong references on purpose: the daemon flusher thread keeps only the batch manager
+# alive, so without this registry the garbage collector could collect an instance while
+# its events are still in flight — escaping both shutdown() and the atexit safety net.
+# Instances remove themselves in shutdown().
+_LIVE_INSTANCES: "set[Alitycs]" = set()
 
 
 def init(*args: Any, **kwargs: Any) -> Alitycs:
@@ -264,55 +298,81 @@ def init(*args: Any, **kwargs: Any) -> Alitycs:
 
 
 def get_default_instance() -> Optional[Alitycs]:
+    """The current module default, if one has been initialized. Stays installed after
+    ``shutdown()`` — check :attr:`Alitycs.is_shutdown` to see whether it is usable."""
     return _default_instance
 
 
+def _default_for_write() -> Optional[Alitycs]:
+    """The default instance to delegate to, or ``None`` for the pre-init no-op contract.
+
+    Raises ``RuntimeError`` when the previous default has already been shut down:
+    silently dropping events after shutdown hides data loss from callers.
+    """
+    instance = _default_instance
+    if instance is not None and instance.is_shutdown:
+        raise RuntimeError(
+            "alitycs.<fn>() called after the default instance was shut down; "
+            "create a new default with alitycs.init()"
+        )
+    return instance
+
+
 def track(event_name: str, properties: Optional[Mapping[str, Any]] = None, **kwargs: Any) -> None:
-    if _default_instance is not None:
-        _default_instance.track(event_name, properties, **kwargs)
+    instance = _default_for_write()
+    if instance is not None:
+        instance.track(event_name, properties, **kwargs)
 
 
 def track_revenue(payload: RevenuePayload, properties: Optional[Mapping[str, Any]] = None, **kwargs: Any) -> None:
-    if _default_instance is not None:
-        _default_instance.track_revenue(payload, properties, **kwargs)
+    instance = _default_for_write()
+    if instance is not None:
+        instance.track_revenue(payload, properties, **kwargs)
 
 
 def capture_error(error_name: str, properties: Optional[Mapping[str, Any]] = None, **kwargs: Any) -> None:
-    if _default_instance is not None:
-        _default_instance.capture_error(error_name, properties, **kwargs)
+    instance = _default_for_write()
+    if instance is not None:
+        instance.capture_error(error_name, properties, **kwargs)
 
 
 def identify(user_id: str, traits: Optional[Mapping[str, Any]] = None, **kwargs: Any) -> None:
-    if _default_instance is not None:
-        _default_instance.identify(user_id, traits, **kwargs)
+    instance = _default_for_write()
+    if instance is not None:
+        instance.identify(user_id, traits, **kwargs)
 
 
 def page(name: Optional[str] = None, properties: Optional[Mapping[str, Any]] = None, **kwargs: Any) -> None:
-    if _default_instance is not None:
-        _default_instance.page(name, properties, **kwargs)
+    instance = _default_for_write()
+    if instance is not None:
+        instance.page(name, properties, **kwargs)
 
 
 def reset() -> None:
-    if _default_instance is not None:
-        _default_instance.reset()
+    instance = _default_for_write()
+    if instance is not None:
+        instance.reset()
 
 
 def set_global_properties(properties: Mapping[str, Any]) -> None:
-    if _default_instance is not None:
-        _default_instance.set_global_properties(properties)
+    instance = _default_for_write()
+    if instance is not None:
+        instance.set_global_properties(properties)
 
 
 def flush(timeout: Optional[float] = None) -> bool:
-    if _default_instance is not None:
-        return _default_instance.flush(timeout)
-    return True
+    instance = _default_for_write()
+    if instance is None:
+        return True
+    return instance.flush(timeout)
 
 
 def shutdown(**kwargs: Any) -> None:
-    global _default_instance
+    """Shut down the default instance (drains fully). Safe to call more than once and
+    before :func:`init`; afterwards the module-level API raises until a new default
+    is created with :func:`init`."""
     if _default_instance is not None:
         _default_instance.shutdown(**kwargs)
-        _default_instance = None
 
 
 def _shutdown_all_at_exit() -> None:
@@ -325,6 +385,53 @@ def _shutdown_all_at_exit() -> None:
 
 
 atexit.register(_shutdown_all_at_exit)
+
+
+def _flush_all_live(timeout: float = 10.0) -> None:
+    """Best-effort drain of every live instance; never raises."""
+    for instance in list(_LIVE_INSTANCES):
+        try:
+            instance.flush(timeout)
+        except Exception:  # noqa: BLE001 - signal handlers must not raise
+            pass
+
+
+def _make_termination_handler(signum: int):
+    """Build the handler installed for SIGTERM/SIGINT: flush live instances, then
+    restore the default disposition and re-raise the signal so process exit status
+    still reflects the termination."""
+
+    def _handle(signum_received: int, frame: Any) -> None:  # noqa: ARG001 - signal API
+        _flush_all_live()
+        try:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+            return  # unreachable once the default handler terminates the process
+        except Exception:  # noqa: BLE001 - last resort when re-raising is impossible
+            raise SystemExit(128 + signum) from None
+
+    return _handle
+
+
+def _install_signal_handlers() -> None:
+    """Register SIGTERM/SIGINT flush handlers from the main thread only. Non-main
+    threads cannot install signal handlers (Python raises ``ValueError``); there the
+    atexit safety net remains the fallback."""
+    if threading.current_thread() is not threading.main_thread():
+        return
+    if os.name == "nt" and not hasattr(signal, "SIGTERM"):
+        return
+    for sig in (signal.SIGTERM, getattr(signal, "SIGINT", None)):
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _make_termination_handler(sig))
+        except (ValueError, OSError, RuntimeError):
+            # Not permitted here (e.g. embedded interpreter or non-main thread race).
+            pass
+
+
+_install_signal_handlers()
 
 if hasattr(os, "register_at_fork"):
 

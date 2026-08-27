@@ -185,6 +185,51 @@ class TestRevenueValidationShared:
         payload = RevenuePayload.transaction(fact_id="f", amount="12345678901234567890123456789012345678", currency="USD")
         assert payload.amount.endswith("678")
 
+    # Per-kind exclusivity mirrors the server: foreign fields are rejected.
+
+    def test_transaction_rejects_recurring_only_fields(self):
+        with pytest.raises(RevenueError, match="another revenue kind"):
+            RevenuePayload(
+                kind="transaction", fact_id="f", amount="1.00", currency="USD",
+                subscription_id="sub_1",
+            )
+        with pytest.raises(RevenueError, match="another revenue kind"):
+            RevenuePayload(
+                kind="transaction", fact_id="f", amount="1.00", currency="USD",
+                mrr_amount="5.00",
+            )
+        with pytest.raises(RevenueError, match="another revenue kind"):
+            RevenuePayload(
+                kind="transaction", fact_id="f", amount="1.00", currency="USD",
+                expected_active_subscriptions=3,
+            )
+
+    def test_mrr_snapshot_rejects_transaction_or_baseline_fields(self):
+        for extra in (
+            {"amount": "1.00"},
+            {"expected_active_subscriptions": 3},
+        ):
+            with pytest.raises(RevenueError, match="another revenue kind"):
+                RevenuePayload(
+                    kind="mrr_snapshot", fact_id="f", currency="USD",
+                    subscription_id="s", customer_id="c", mrr_amount="5.00",
+                    **extra,
+                )
+
+    def test_mrr_baseline_complete_rejects_amount_and_identity_fields(self):
+        for extra in (
+            {"amount": "1.00"},
+            {"mrr_amount": "5.00"},
+            {"subscription_id": "s"},
+            {"customer_id": "c"},
+        ):
+            with pytest.raises(RevenueError, match="another revenue kind"):
+                RevenuePayload(
+                    kind="mrr_baseline_complete", fact_id="f", currency="USD",
+                    expected_active_subscriptions=2,
+                    **extra,
+                )
+
 
 class TestAnalyticsEvent:
     def test_to_dict_uses_wire_names_and_omits_absent_user_and_revenue(self):

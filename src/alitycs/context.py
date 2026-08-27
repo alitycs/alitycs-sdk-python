@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import platform
 from datetime import datetime, timezone
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 from .types import EventContext
 
@@ -36,7 +37,45 @@ def _get_locale() -> Optional[str]:
 
 
 def _get_timezone() -> Optional[str]:
+    """Report the local timezone as an IANA identifier ("America/New_York").
+
+    Abbreviations like "EST" are ambiguous (several zones share them) and carry no
+    UTC offset, so an IANA key is resolved from ``TZ`` or the ``/etc/localtime``
+    target first; the abbreviation stays as the fallback where neither resolves
+    (notably Windows).
+    """
+    try:
+        from zoneinfo import ZoneInfo
+
+        key = _local_iana_key()
+        if key:
+            return ZoneInfo(key).key
+    except Exception:  # noqa: BLE001 - environment probing must never break tracking
+        pass
     return datetime.now(timezone.utc).astimezone().tzname()
+
+
+def _local_iana_key() -> Optional[str]:
+    """Best-effort IANA key of the system timezone, or ``None`` when unknowable."""
+    candidates: List[str] = []
+    env_tz = os.environ.get("TZ")
+    if env_tz:
+        candidates.append(env_tz.lstrip(":"))
+    try:
+        real = os.path.realpath("/etc/localtime")
+        marker = "zoneinfo/"
+        if marker in real:
+            candidates.append(real.rsplit(marker, 1)[1])
+    except OSError:
+        pass
+    for candidate in candidates:
+        try:
+            from zoneinfo import ZoneInfo
+
+            return ZoneInfo(candidate).key
+        except Exception:  # noqa: BLE001 - unresolvable candidates fall through
+            continue
+    return None
 
 
 def _safe(getter: Callable[[], Optional[str]]) -> Optional[str]:

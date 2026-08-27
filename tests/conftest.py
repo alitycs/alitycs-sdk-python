@@ -21,7 +21,8 @@ class CaptureServer:
     ``fail_on`` marks specific 1-based request sequences to answer 500 (once each),
     exercising the transport's retry path against real socket I/O. ``delay`` slows a
     matching response (seconds, or a callable receiving the request dict) so tests can
-    observe a send genuinely in flight.
+    observe a send genuinely in flight. A ``responder`` may return an int status or a
+    ``(status, extra_headers)`` tuple (e.g. to send ``Retry-After`` with a 429).
     """
 
     def __init__(
@@ -47,8 +48,13 @@ class CaptureServer:
                     payload = None
                 with outer._lock:
                     sequence = len(outer.requests) + 1
+                    extra_headers: Dict[str, str] = {}
                     if responder is not None:
-                        status = responder({"sequence": sequence, "payload": payload})
+                        answered = responder({"sequence": sequence, "payload": payload})
+                        if isinstance(answered, tuple):
+                            status, extra_headers = answered
+                        else:
+                            status = answered
                     elif sequence in outer._fail_on:
                         status = 500
                     else:
@@ -71,6 +77,8 @@ class CaptureServer:
                         time.sleep(seconds)
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
+                for name, value in extra_headers.items():
+                    self.send_header(name, value)
                 self.end_headers()
                 self.wfile.write(b'{"accepted":true}')
 

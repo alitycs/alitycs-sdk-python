@@ -162,14 +162,40 @@ class RevenuePayload:
         required: Dict[str, Any] = {}
         if self.kind == "transaction":
             required["amount"] = self.amount
+            # Per-kind exclusivity mirrors the server: a transaction fact must not carry
+            # recurring-revenue fields.
+            _reject_foreign_fields(
+                self.kind,
+                {
+                    "subscriptionId": self.subscription_id,
+                    "mrrAmount": self.mrr_amount,
+                    "expectedActiveSubscriptions": self.expected_active_subscriptions,
+                },
+            )
         elif self.kind == "mrr_snapshot":
             required = {
                 "subscriptionId": self.subscription_id,
                 "customerId": self.customer_id,
                 "mrrAmount": self.mrr_amount,
             }
+            _reject_foreign_fields(
+                self.kind,
+                {
+                    "amount": self.amount,
+                    "expectedActiveSubscriptions": self.expected_active_subscriptions,
+                },
+            )
         else:
             required["expectedActiveSubscriptions"] = self.expected_active_subscriptions
+            _reject_foreign_fields(
+                self.kind,
+                {
+                    "amount": self.amount,
+                    "mrrAmount": self.mrr_amount,
+                    "subscriptionId": self.subscription_id,
+                    "customerId": self.customer_id,
+                },
+            )
         for name, value in required.items():
             if value is None or (isinstance(value, str) and not value.strip()):
                 raise RevenueError(f"{self.kind} requires {name}")
@@ -208,6 +234,13 @@ def _validate_decimal(value: str) -> None:
     digits = value.lstrip("-").replace(".", "").lstrip("0")
     if len(digits) > _MAX_DECIMAL_PRECISION:
         raise RevenueError("Revenue amounts must not exceed 38 digits of precision")
+
+
+def _reject_foreign_fields(kind: str, fields: Dict[str, Any]) -> None:
+    """Reject fields that belong to a different revenue kind, as the server does."""
+    present = [name for name, value in fields.items() if value is not None]
+    if present:
+        raise RevenueError(f"{kind} revenue contains fields for another revenue kind: {', '.join(sorted(present))}")
 
 
 @dataclass(frozen=True)

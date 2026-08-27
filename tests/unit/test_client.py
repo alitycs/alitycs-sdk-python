@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import pathlib
 import threading
-from typing import Any, Dict
+import time
+from typing import Any, Dict, List
 
 import pytest
 
@@ -126,7 +128,7 @@ class TestInstanceBasics:
             flush_interval=None,
             batching=False,
             max_retries=0,
-            retry_backoff_base=0.0,
+            retry_backoff_base=0.001,  # unused with max_retries=0; must now be positive
         )
         client.track("inline_doomed")  # must not raise despite the 500
         client.shutdown(join_timeout=2.0)
@@ -141,10 +143,52 @@ class TestInstanceBasics:
         )
         client.track("q1")
         client.track("q2")
-        client.track("q3")  # over the cap: dropped silently
+        client.track("q3")  # over the cap: dropped loudly
         assert client.flush()
         assert sorted(capture_server.event_names) == ["q1", "q2"]
         client.shutdown(join_timeout=2.0)
+
+    def test_oversized_property_is_rejected_locally_and_never_queued(self, capture_server, capsys):
+        client = self._client_with(capture_server)
+        client.track("too_big", {"payload": "x" * 1001})
+        captured = capsys.readouterr()
+
+        assert client.pending == 0  # never queued, never sent
+        assert client.rejected_locally == 1
+        assert "WARN" in captured.err
+        assert client.flush() is True
+        assert capture_server.requests == []
+        client.shutdown(join_timeout=2.0)
+
+    def test_seconds_scale_timestamp_is_rejected_locally(self, capture_server, capsys):
+        client = self._client_with(capture_server)
+        client.track("stale_clock", {}, timestamp=int(time.time()))
+        captured = capsys.readouterr()
+
+        assert client.pending == 0
+        assert client.rejected_locally == 1
+        assert "epoch milliseconds" in captured.err
+        client.shutdown(join_timeout=2.0)
+
+    def test_valid_events_still_enqueue_after_a_local_rejection(self, capture_server):
+        client = self._client_with(capture_server)
+        client.track("bad", {"payload": "x" * 1001})
+        client.track("good", {"n": 1})
+        assert client.rejected_locally == 1
+        assert client.pending == 1
+
+        assert client.flush() is True
+        assert capture_server.event_names == ["good"]
+        client.shutdown(join_timeout=2.0)
+
+    @staticmethod
+    def _client_with(capture_server) -> Alitycs:
+        return Alitycs(
+            api_key="pk_unit",
+            endpoint=capture_server.url,
+            flush_size=100,
+            flush_interval=None,
+        )
 
 
 class TestModuleLevelApi:
@@ -192,15 +236,85 @@ class TestModuleLevelApi:
         post = capture_server.events[-1]
         assert "userId" not in post
         mod_shutdown()
-        assert get_default_instance() is None
+        assert get_default_instance() is sdk
+        assert sdk.is_shutdown
 
     def test_calls_before_init_are_no_ops(self):
+        import alitycs.client as client_module
+
+        sentinel = client_module._default_instance
+        client_module._default_instance = None
+        try:
+            assert mod_flush() is True
+            mod_track("never_sent")  # must not raise
+        finally:
+            client_module._default_instance = sentinel
+
+    def test_module_api_raises_after_shutdown(self, capture_server, sdk):
+        """Post-shutdown module calls used to no-op silently while flush() returned
+        True — hiding data loss. The contract is now a clear RuntimeError."""
         mod_shutdown()
-        assert mod_flush() is True
-        mod_track("never_sent")  # must not raise
+        with pytest.raises(RuntimeError, match="shut down"):
+            mod_track("after_shutdown")
+        with pytest.raises(RuntimeError, match="shut down"):
+            mod_capture_error("after_shutdown")
+        with pytest.raises(RuntimeError, match="shut down"):
+            mod_identify("usr_after")
+        with pytest.raises(RuntimeError, match="shut down"):
+            mod_page("AfterShutdown")
+        with pytest.raises(RuntimeError, match="shut down"):
+            mod_reset()
+        with pytest.raises(RuntimeError, match="shut down"):
+            mod_set_global_properties({"k": "v"})
+        with pytest.raises(RuntimeError, match="shut down"):
+            mod_flush()
+        # shutdown() itself stays safe to repeat.
+        mod_shutdown()
+
+    def test_reinit_restores_the_module_api_after_shutdown(self, capture_server, sdk):
+        mod_shutdown()
+        fresh = init("pk_again", endpoint=capture_server.url, flush_size=100, flush_interval=None)
+        try:
+            mod_track("fresh_after_reinit")
+            assert mod_flush()
+            assert drain(capture_server, 1)
+        finally:
+            fresh.shutdown(join_timeout=2.0)
+
+    def test_instance_level_is_shutdown_flag(self, capture_server):
+        client = Alitycs(api_key="pk_flag", endpoint=capture_server.url, flush_size=100, flush_interval=None)
+        assert client.is_shutdown is False
+        client.shutdown(join_timeout=2.0)
+        assert client.is_shutdown is True
 
 
 class TestProcessHooks:
+    def test_live_instances_hold_strong_refs_until_shutdown(self, capture_server):
+        """The flusher thread keeps only the batch manager alive, so with a WeakSet the
+        GC could collect an instance mid-flight — escaping shutdown and the atexit net."""
+        import gc
+        import weakref
+
+        import alitycs.client as client_module
+
+        client = Alitycs(api_key="pk_strongref", endpoint=capture_server.url, flush_size=100, flush_interval=None)
+        client.track("strongref_drain")
+        ref = weakref.ref(client)
+        del client
+        gc.collect()
+
+        # Still alive (and deliverable) despite no user-held references...
+        survivor = next(i for i in client_module._LIVE_INSTANCES if i.config.api_key == "pk_strongref")
+        assert survivor.flush()
+        assert drain(capture_server, 1)
+
+        # ...and released once shutdown removes it from the registry.
+        survivor.shutdown(join_timeout=2.0)
+        del survivor  # drop this test's own reference before checking the registry let go
+        gc.collect()
+        assert ref() is None
+        assert all(i.config.api_key != "pk_strongref" for i in client_module._LIVE_INSTANCES)
+
     def test_atexit_handler_shuts_down_live_instances(self, capture_server):
         from alitycs.client import _shutdown_all_at_exit
 
@@ -242,6 +356,46 @@ class TestProcessHooks:
         assert client.flush()
         assert drain(capture_server, 1)
         client.shutdown(join_timeout=2.0)
+
+    def test_sigterm_flushes_live_instances_before_default_termination(self, capture_server):
+        """atexit alone misses SIGTERM. A child that tracks an event and is then
+        SIGTERMed must still deliver it, then die by the default disposition."""
+        import os
+        import signal
+        import subprocess
+        import sys
+        import textwrap
+
+        src_dir = str(pathlib.Path(__file__).resolve().parents[2] / "src")
+        child_script = textwrap.dedent(
+            f"""
+            from alitycs import Alitycs
+
+            client = Alitycs(
+                api_key="pk_sig",
+                endpoint={capture_server.url!r},
+                flush_size=100,
+                flush_interval=None,
+            )
+            client.track("sigterm_drain")  # stays queued: nothing dispatches it
+            import os, signal
+            os.kill(os.getpid(), signal.SIGTERM)
+            """
+        )
+        env = dict(os.environ)
+        env["PYTHONPATH"] = src_dir + os.pathsep + env.get("PYTHONPATH", "")
+        proc = subprocess.run(
+            [sys.executable, "-c", child_script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+
+        assert drain(capture_server, 1), f"SIGTERM flush did not deliver; stderr:\n{proc.stderr}"
+        assert capture_server.event_names == ["sigterm_drain"]
+        if os.name != "nt":
+            assert proc.returncode == -signal.SIGTERM  # default handler re-raised the signal
 
 
 class TestBatchManagerEdges:
