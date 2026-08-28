@@ -261,11 +261,21 @@ def test_unbounded_repeat_shutdown_can_resume_a_timed_out_inflight_send():
     manager.shutdown(join_timeout=0.05)
 
     finished = threading.Event()
-    drainer = threading.Thread(
-        target=lambda: (manager.shutdown(join_timeout=None), finished.set())
-    )
+
+    def drain() -> None:
+        manager.shutdown(join_timeout=None)
+        finished.set()
+
+    drainer = threading.Thread(target=drain)
     drainer.start()
-    time.sleep(0.05)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        with manager._cv:
+            if not manager._finite_shutdown_complete:
+                break
+        time.sleep(0.001)
+    else:  # pragma: no cover - assertion guard
+        raise AssertionError("unbounded shutdown did not resume draining")
     release.set()
 
     assert finished.wait(2)

@@ -98,12 +98,13 @@ class FileBatchStore:
 
     @property
     def enabled(self) -> bool:
-        return self._path is not None
+        with self._lock:
+            return self._path is not None
 
     def put(self, batch_id: str, body: bytes, event_count: int) -> None:
-        if not self.enabled:
-            return
         with self._lock:
+            if self._path is None:
+                return
             if batch_id in self._records:
                 return
             if event_count < 1 or self.pending_events + event_count > self._max_pending_events:
@@ -122,9 +123,9 @@ class FileBatchStore:
                 raise
 
     def acknowledge(self, batch_id: str) -> None:
-        if not self.enabled:
-            return
         with self._lock:
+            if self._path is None:
+                return
             if batch_id not in self._records:
                 return
             previous = self._copy_records()
@@ -136,9 +137,9 @@ class FileBatchStore:
                 raise
 
     def pause(self, batch_id: str, paused_until: Optional[float]) -> None:
-        if not self.enabled:
-            return
         with self._lock:
+            if self._path is None:
+                return
             record = self._records.get(batch_id)
             if record is not None:
                 previous = self._copy_records()
@@ -171,9 +172,10 @@ class FileBatchStore:
 
     def close(self) -> None:
         """Release this process's ownership without deleting retained batches."""
-        self._release_ownership()
-        self._path = None
-        self._records = {}
+        with self._lock:
+            self._release_ownership()
+            self._path = None
+            self._records = {}
 
     def __del__(self) -> None:  # pragma: no cover - deterministic callers use close()
         try:
