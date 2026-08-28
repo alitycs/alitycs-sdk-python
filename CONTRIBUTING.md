@@ -6,11 +6,12 @@ signal safety, bounded delivery, and honest lifecycle outcomes.
 Run these checks before opening a pull request:
 
 ```bash
-python -m pip install -e '.[dev]'
+python -m pip install --require-hashes -r requirements-dev.txt
+python -m pip install --no-deps --no-build-isolation -e .
 python -m ruff check src tests scripts/e2e_run.py
 python -m pytest --cov=alitycs --cov-branch --cov-report=json --cov-fail-under=90
 python scripts/coverage_gate.py
-python -m build
+python -m build --no-isolation
 ./scripts/verify-workflow-pins.rb
 ./scripts/validate-coderabbit.sh
 ./scripts/test-coderabbit-policy.rb

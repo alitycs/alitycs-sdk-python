@@ -51,12 +51,13 @@ failures << "custom gate must stay absent" unless docs.include?("No shared polic
   "/scripts/validate-coderabbit.sh" => "@bulanovdm",
   "/scripts/verify-workflow-pins.rb" => "@bulanovdm",
   "/scripts/test-coderabbit-policy.rb" => "@bulanovdm",
+  "/requirements-dev.txt" => "@bulanovdm",
 }.each do |path, expected_owner|
   actual_owners = owner_entries[path] || []
   failures << "missing CODEOWNER: #{path} #{expected_owner}" unless actual_owners.include?(expected_owner)
 end
 
-workflow_runs = lambda do |workflow|
+workflow_steps = lambda do |workflow|
   jobs = workflow["jobs"]
   next [] unless jobs.is_a?(Hash)
 
@@ -64,7 +65,7 @@ workflow_runs = lambda do |workflow|
     steps = job.is_a?(Hash) ? job["steps"] : nil
     next [] unless steps.is_a?(Array)
 
-    steps.filter_map { |step| step.is_a?(Hash) && step["run"].is_a?(String) ? step["run"] : nil }
+    steps.filter_map { |step| step.is_a?(Hash) ? [job, step] : nil }
   end
 end
 
@@ -77,64 +78,88 @@ shell_lines = lambda do |run|
   end
 end
 
-executable_reference = lambda do |runs, command|
-  invocation = /\A(?:command\s+|exec\s+)?#{Regexp.escape(command)}\z/
-  runs.any? { |run| shell_lines.call(run).any? { |line| line.match?(invocation) } }
+unconditional_exact_step = lambda do |job, step, expected_lines|
+  job.is_a?(Hash) &&
+    step.is_a?(Hash) &&
+    !job.key?("if") &&
+    !step.key?("if") &&
+    !job.key?("continue-on-error") &&
+    !step.key?("continue-on-error") &&
+    step["run"].is_a?(String) &&
+    shell_lines.call(step["run"]) == expected_lines
 end
 
 probe_command = "./scripts/test-coderabbit-policy.rb"
-failures << "commented policy commands must not count" if executable_reference.call(["# #{probe_command}"], probe_command)
-failures << "echoed policy commands must not count" if executable_reference.call(["echo #{probe_command}"], probe_command)
-failures << "ignored policy failures must not count" if executable_reference.call(["#{probe_command} || true"], probe_command)
+probe_job = {}
+{
+  "commented policy commands" => "# #{probe_command}",
+  "echoed policy commands" => "echo #{probe_command}",
+  "ignored policy failures" => "#{probe_command} || true",
+  "commands in inactive functions" => "inactive() {\n  #{probe_command}\n}",
+  "commands in false conditionals" => "if false; then\n  #{probe_command}\nfi",
+}.each do |description, run|
+  if unconditional_exact_step.call(probe_job, { "run" => run }, [probe_command])
+    failures << "#{description} must not count"
+  end
+end
+if unconditional_exact_step.call(probe_job, { "if" => "false", "run" => probe_command }, [probe_command])
+  failures << "conditionally disabled policy steps must not count"
+end
 
-ci_runs = workflow_runs.call(ci_data)
+ci_steps = workflow_steps.call(ci_data)
 {
   "./scripts/verify-workflow-pins.rb" => "CI must verify workflow pins",
   "./scripts/validate-coderabbit.sh" => "CI must validate CodeRabbit policy",
   "./scripts/test-coderabbit-policy.rb" => "CI must run governance tests",
 }.each do |command, message|
-  failures << message unless executable_reference.call(ci_runs, command)
+  present = ci_steps.any? do |job, step|
+    unconditional_exact_step.call(job, step, [command])
+  end
+  failures << "#{message} in a dedicated unconditional step" unless present
 end
 
 failures << "release permissions must default closed" unless release_data["permissions"] == {}
 release_jobs = release_data["jobs"]
-build_steps = release_jobs.dig("build", "steps") if release_jobs.is_a?(Hash)
-release_steps = release_jobs.dig("release", "steps") if release_jobs.is_a?(Hash)
+build_job = release_jobs["build"] if release_jobs.is_a?(Hash)
+release_job = release_jobs["release"] if release_jobs.is_a?(Hash)
+build_steps = build_job["steps"] if build_job.is_a?(Hash)
+release_steps = release_job["steps"] if release_job.is_a?(Hash)
 verify_step = build_steps&.find { |step| step.is_a?(Hash) && step["id"] == "verify_tag" }
 recheck_step = release_steps&.find do |step|
   step.is_a?(Hash) && step["name"] == "Recheck immutable release tag"
 end
 create_step = release_steps&.find { |step| step.is_a?(Hash) && step["name"] == "Create GitHub Release" }
-verify_run = verify_step.is_a?(Hash) ? verify_step["run"].to_s : ""
-recheck_run = recheck_step.is_a?(Hash) ? recheck_step["run"].to_s : ""
-create_run = create_step.is_a?(Hash) ? create_step["run"].to_s : ""
-verify_lines = shell_lines.call(verify_run)
-recheck_lines = shell_lines.call(recheck_run)
-create_lines = shell_lines.call(create_run)
-tag_guard = 'if [[ "$(git cat-file -t "$GITHUB_REF")" != "tag" ]]; then'
-guard_start = verify_lines.index(tag_guard)
-guard_end = guard_start && verify_lines.each_index.find { |index| index > guard_start && verify_lines[index] == "fi" }
-guard_fails = guard_start && guard_end && verify_lines[(guard_start + 1)...guard_end].any? do |line|
-  line.match?(/\Aexit\s+[1-9][0-9]*\z/)
-end
-unless guard_fails &&
-    verify_lines.include?('tag_object="$(git rev-parse "${GITHUB_REF}^{tag}")"') &&
-    verify_lines.include?('tag_commit="$(git rev-parse "${GITHUB_REF}^{commit}")"') &&
-    verify_lines.include?('[[ "$tag_commit" == "$GITHUB_SHA" ]]')
+verify_lines = [
+  'git fetch --no-tags --force origin "+refs/heads/main:refs/remotes/origin/main"',
+  'if [[ "$(git cat-file -t "$GITHUB_REF")" != "tag" ]]; then',
+  'echo "error: releases require an annotated tag" >&2',
+  "exit 1",
+  "fi",
+  'tag_object="$(git rev-parse "${GITHUB_REF}^{tag}")"',
+  'tag_commit="$(git rev-parse "${GITHUB_REF}^{commit}")"',
+  '[[ "$tag_commit" == "$GITHUB_SHA" ]]',
+  'git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main',
+  'version="$(python -c \'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])\')"',
+  '[[ "$GITHUB_REF_NAME" == "v${version}" ]]',
+  'PYTHONPATH=src python -c \'import alitycs, alitycs.client; assert alitycs.__version__ == alitycs.client.__version__ == "\'"$version"\'"\'',
+  'printf \'tag_commit=%s\\ntag_object=%s\\n\' "$tag_commit" "$tag_object" >> "$GITHUB_OUTPUT"',
+]
+unless unconditional_exact_step.call(build_job, verify_step, verify_lines)
   failures << "release must require annotated tags"
 end
-tag_identity_rechecked = lambda do |lines|
-  lines.include?(
-    '[[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{tag}")" == "$EXPECTED_TAG_OBJECT" ]]',
-  ) && lines.include?(
-    '[[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")" == "$EXPECTED_TAG_COMMIT" ]]',
-  ) && lines.include?('[[ "$GITHUB_SHA" == "$EXPECTED_TAG_COMMIT" ]]')
-end
-unless tag_identity_rechecked.call(recheck_lines)
+recheck_lines = [
+  'git fetch --force origin "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"',
+  '[[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{tag}")" == "$EXPECTED_TAG_OBJECT" ]]',
+  '[[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")" == "$EXPECTED_TAG_COMMIT" ]]',
+  '[[ "$GITHUB_SHA" == "$EXPECTED_TAG_COMMIT" ]]',
+]
+unless unconditional_exact_step.call(release_job, recheck_step, recheck_lines)
   failures << "release must recheck immutable tag"
 end
-unless tag_identity_rechecked.call(create_lines) &&
-    create_lines.include?('gh release create "$GITHUB_REF_NAME" release/* --verify-tag --generate-notes')
+create_lines = recheck_lines + [
+  'gh release create "$GITHUB_REF_NAME" release/* --verify-tag --generate-notes',
+]
+unless unconditional_exact_step.call(release_job, create_step, create_lines)
   failures << "release must recheck immutable tag immediately before creation"
 end
 failures << "release workflow must not use concurrency" if release_data.key?("concurrency")

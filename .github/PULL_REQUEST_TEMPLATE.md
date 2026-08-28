@@ -12,7 +12,7 @@ Describe the user-visible change and why it is needed.
 
 - [ ] `python -m ruff check src tests scripts/e2e_run.py`
 - [ ] Coverage and branch gates passed.
-- [ ] `python -m build`
+- [ ] `python -m build --no-isolation`
 
 ## Automated review
 

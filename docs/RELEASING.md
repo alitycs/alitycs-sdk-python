@@ -4,7 +4,7 @@
    section in a pull request.
 2. Run lint, tests, coverage, build, and governance checks.
 3. Merge after CI and CodeRabbit review.
-4. Create and push an annotated tag matching the package version.
+4. Create and push an annotated `v<project.version>` tag (for example, `v1.0.0`).
 5. The release workflow verifies reviewed `main`, builds the wheel and source distribution,
    rechecks immutable tag identity before attestation and again immediately before creating the
    GitHub Release, then publishes to PyPI using trusted publishing.

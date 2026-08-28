@@ -10,7 +10,6 @@ permissions: {}
 jobs:
   build:
     name: Build release artifacts
-    if: github.repository == 'alitycs/alitycs-sdk-python'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     outputs:
@@ -24,6 +23,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13.15"
       - name: Verify tag targets reviewed main history
         id: verify_tag
         shell: bash
@@ -39,22 +42,19 @@ jobs:
           git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main
           version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
           [[ "$GITHUB_REF_NAME" == "v${version}" ]]
-          PYTHONPATH=src python -c \
-            'import alitycs, alitycs.client; assert alitycs.__version__ == alitycs.client.__version__ == "'"$version"'"'
+          PYTHONPATH=src python -c 'import alitycs, alitycs.client; assert alitycs.__version__ == alitycs.client.__version__ == "'"$version"'"'
           printf 'tag_commit=%s\ntag_object=%s\n' "$tag_commit" "$tag_object" >> "$GITHUB_OUTPUT"
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.13.15"
       - name: Install development tooling
-        run: python -m pip install --disable-pip-version-check -e '.[dev]'
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes -r requirements-dev.txt
+          python -m pip install --disable-pip-version-check --no-deps --no-build-isolation -e .
       - name: Verify and build release
         run: |
           python -m ruff check src tests scripts/e2e_run.py
           python -m pytest --cov=alitycs --cov-branch --cov-report=json --cov-fail-under=90
           python scripts/coverage_gate.py
-          python -m build
-          python -m pip install --force-reinstall dist/*.whl
+          python -m build --no-isolation
+          python -m pip install --force-reinstall --no-deps dist/*.whl
           python -c 'import alitycs'
       - name: Prepare release artifacts
         run: |
