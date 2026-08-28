@@ -68,14 +68,24 @@ workflow_runs = lambda do |workflow|
   end
 end
 
-executable_reference = lambda do |runs, command|
-  runs.any? do |run|
-    run.lines.any? do |line|
-      stripped = line.strip
-      !stripped.empty? && !stripped.start_with?("#") && stripped.include?(command)
-    end
+shell_lines = lambda do |run|
+  run.each_line.filter_map do |line|
+    stripped = line.strip
+    next if stripped.empty? || stripped.start_with?("#")
+
+    stripped
   end
 end
+
+executable_reference = lambda do |runs, command|
+  invocation = /\A(?:command\s+|exec\s+)?#{Regexp.escape(command)}\z/
+  runs.any? { |run| shell_lines.call(run).any? { |line| line.match?(invocation) } }
+end
+
+probe_command = "./scripts/test-coderabbit-policy.rb"
+failures << "commented policy commands must not count" if executable_reference.call(["# #{probe_command}"], probe_command)
+failures << "echoed policy commands must not count" if executable_reference.call(["echo #{probe_command}"], probe_command)
+failures << "ignored policy failures must not count" if executable_reference.call(["#{probe_command} || true"], probe_command)
 
 ci_runs = workflow_runs.call(ci_data)
 {
@@ -96,12 +106,25 @@ recheck_step = release_steps&.find do |step|
 end
 verify_run = verify_step.is_a?(Hash) ? verify_step["run"].to_s : ""
 recheck_run = recheck_step.is_a?(Hash) ? recheck_step["run"].to_s : ""
-unless verify_run.include?("git cat-file -t") && verify_run.include?("^{tag}")
+verify_lines = shell_lines.call(verify_run)
+recheck_lines = shell_lines.call(recheck_run)
+tag_guard = 'if [[ "$(git cat-file -t "$GITHUB_REF")" != "tag" ]]; then'
+guard_start = verify_lines.index(tag_guard)
+guard_end = guard_start && verify_lines.each_index.find { |index| index > guard_start && verify_lines[index] == "fi" }
+guard_fails = guard_start && guard_end && verify_lines[(guard_start + 1)...guard_end].any? do |line|
+  line.match?(/\Aexit\s+[1-9][0-9]*\z/)
+end
+unless guard_fails &&
+    verify_lines.include?('tag_object="$(git rev-parse "${GITHUB_REF}^{tag}")"') &&
+    verify_lines.include?('tag_commit="$(git rev-parse "${GITHUB_REF}^{commit}")"') &&
+    verify_lines.include?('[[ "$tag_commit" == "$GITHUB_SHA" ]]')
   failures << "release must require annotated tags"
 end
-unless recheck_run.include?("EXPECTED_TAG_OBJECT") &&
-    recheck_run.include?("EXPECTED_TAG_COMMIT") &&
-    recheck_run.include?("git rev-parse")
+unless recheck_lines.include?(
+  '[[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{tag}")" == "$EXPECTED_TAG_OBJECT" ]]',
+) && recheck_lines.include?(
+  '[[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")" == "$EXPECTED_TAG_COMMIT" ]]',
+) && recheck_lines.include?('[[ "$GITHUB_SHA" == "$EXPECTED_TAG_COMMIT" ]]')
   failures << "release must recheck immutable tag"
 end
 failures << "release workflow must not use concurrency" if release_data.key?("concurrency")
