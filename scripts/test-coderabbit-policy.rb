@@ -1,24 +1,35 @@
 #!/usr/bin/env ruby
 
 require "pathname"
+require "yaml"
 
 root = Pathname.new(__dir__).parent
 failures = []
 read = ->(path) { root.join(path).read }
 policy = read.call(".coderabbit.yaml")
+policy_data = YAML.safe_load(policy, aliases: false)
 docs = read.call("docs/coderabbit.md")
 ci = read.call(".github/workflows/ci.yml")
 release = read.call(".github/workflows/release.yml")
 owners = read.call(".github/CODEOWNERS")
 
-[
-  "request_changes_workflow: true",
-  "review_progress: true",
-  "fail_commit_status: true",
-  "enabled: true",
-  "auto_incremental_review: true",
-  "github-checks:",
-].each { |value| failures << "missing policy setting: #{value}" unless policy.include?(value) }
+dig = lambda do |*keys|
+  keys.reduce(policy_data) { |node, key| node.is_a?(Hash) ? node[key] : nil }
+end
+
+{
+  %w[reviews request_changes_workflow] => true,
+  %w[reviews review_progress] => true,
+  %w[reviews fail_commit_status] => true,
+  %w[reviews auto_review enabled] => true,
+  %w[reviews auto_review auto_incremental_review] => true,
+  %w[reviews tools github-checks enabled] => true,
+}.each do |keys, expected|
+  actual = dig.call(*keys)
+  next if actual == expected
+
+  failures << "policy setting #{keys.join('.')} must be #{expected}, found #{actual.inspect}"
+end
 
 failures << "bot exclusions are forbidden" if policy.include?("ignore_usernames:")
 failures << "custom gate workflow is forbidden" if root.join(".github/workflows/coderabbit-gate.yml").exist?
