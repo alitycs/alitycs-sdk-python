@@ -4,6 +4,12 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    exclude-paths:
+      - scripts/coderabbit-validator-requirements.txt
+    groups:
+      python-dependencies:
+        patterns:
+          - "*"
   - package-ecosystem: github-actions
     directory: /
     schedule:
