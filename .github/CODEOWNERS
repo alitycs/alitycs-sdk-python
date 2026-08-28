@@ -1,0 +1,12 @@
+# Code review and automation governance
+/.coderabbit.yaml @bulanovdm
+/.github/ @bulanovdm
+/scripts/ @bulanovdm
+/scripts/coderabbit-schema.v2.json @bulanovdm
+/scripts/coderabbit-validator-requirements.txt @bulanovdm
+/scripts/validate-coderabbit.sh @bulanovdm
+/scripts/verify-workflow-pins.rb @bulanovdm
+/scripts/test-coderabbit-policy.rb @bulanovdm
+/docs/coderabbit.md @bulanovdm
+/CONTRIBUTING.md @bulanovdm
+/requirements-dev.txt @bulanovdm

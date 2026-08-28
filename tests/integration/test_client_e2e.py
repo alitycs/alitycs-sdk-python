@@ -135,10 +135,12 @@ def test_reset_rotates_identity_and_drops_user_id(capture_server):
     client.track("post_reset")
     assert client.flush()
 
-    # identify() itself enqueues an event, so the tail is [pre_reset, post_reset].
-    pre_reset, post_reset = capture_server.events[-2:]
-    assert pre_reset["event"] == "pre_reset"
-    assert post_reset["event"] == "post_reset"
+    # flush() may share work with the background sender, so separate HTTP requests can
+    # complete in either order. Identity assertions must select the intended events by
+    # their stable names instead of depending on cross-request arrival timing.
+    events_by_name = {event["event"]: event for event in capture_server.events}
+    pre_reset = events_by_name["pre_reset"]
+    post_reset = events_by_name["post_reset"]
     assert pre_reset["userId"] == "usr_before_reset"
     assert post_reset["anonymousId"] != pre_reset["anonymousId"]
     assert post_reset["sessionId"] != pre_reset["sessionId"]

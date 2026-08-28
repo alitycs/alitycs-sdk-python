@@ -1,0 +1,56 @@
+name: CodeRabbit schema drift
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: Compare pinned and live schemas
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compare the reviewed snapshot with CodeRabbit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          readonly pinned_schema="scripts/coderabbit-schema.v2.json"
+          live_schema="$(mktemp)"
+          readonly live_schema
+          trap 'rm -f "$live_schema"' EXIT
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --proto '=https' \
+            --proto-redir '=https' \
+            --tlsv1.2 \
+            --retry 3 \
+            --retry-connrefused \
+            --max-time 60 \
+            --output "$live_schema" \
+            https://coderabbit.ai/integrations/schema.v2.json
+
+          if cmp --silent "$pinned_schema" "$live_schema"; then
+            echo "The pinned CodeRabbit schema matches the live schema."
+            exit 0
+          fi
+
+          pinned_sha="$(sha256sum "$pinned_schema" | awk '{print $1}')"
+          readonly pinned_sha
+          live_sha="$(sha256sum "$live_schema" | awk '{print $1}')"
+          readonly live_sha
+          echo "::error title=CodeRabbit schema drift::The live schema changed (pinned=$pinned_sha live=$live_sha). Review and update the snapshot, validator, policy, and tests together."
+          exit 1
