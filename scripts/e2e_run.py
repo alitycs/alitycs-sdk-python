@@ -38,7 +38,7 @@ def main() -> int:
         endpoint=endpoint,
         flush_size=10,
         flush_interval=60.0,
-        max_retries=0 if state_file else 3,
+        max_retries=0 if phase == "first" else 3,
         persistence_path=state_file,
     )
     if phase == "first":
@@ -50,7 +50,9 @@ def main() -> int:
             }
         )
         sdk.track(f"sdk_python_restart_{run_id}")
-        sdk.flush()
+        if sdk.flush():
+            print("first phase unexpectedly delivered the event", file=sys.stderr)
+            os._exit(1)
         os._exit(0)
     if phase == "restart":
         if not sdk.flush():

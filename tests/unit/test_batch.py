@@ -171,6 +171,42 @@ def test_shutdown_rejects_new_events_and_is_idempotent():
     assert sent.event_names == ["a"]
 
 
+def test_shutdown_deadline_persists_queued_remainder_while_send_is_blocked():
+    started = threading.Event()
+    release = threading.Event()
+    persisted = []
+
+    def blocked_send(payload: BatchPayload) -> None:
+        started.set()
+        release.wait(5)
+
+    def persist(payload: BatchPayload) -> bool:
+        persisted.append(payload)
+        return True
+
+    manager = BatchManager(
+        flush_size=1,
+        flush_interval=None,
+        max_queue_size=10,
+        send_fn=blocked_send,
+        durable=True,
+        persist_fn=persist,
+    )
+    manager.add(make_event("in-flight"))
+    assert started.wait(2)
+    manager.add(make_event("queued"))
+
+    started_at = time.monotonic()
+    manager.shutdown(join_timeout=0.05)
+    elapsed = time.monotonic() - started_at
+
+    assert elapsed < 0.5
+    assert [[event.event for event in payload.events] for payload in persisted] == [["queued"]]
+
+    release.set()
+    manager.shutdown(join_timeout=None)
+
+
 def test_flush_after_shutdown_still_drains_stragglers_inline():
     sent = SentBatches()
     manager = make_manager(sent, flush_size=100)
@@ -383,7 +419,7 @@ def test_batch_rejection_split_is_bounded_to_sixty_four_sends():
         return SendRejected(400)
 
     manager = BatchManager(
-        flush_size=100,
+        flush_size=101,  # above the event count: only the explicit flush dispatches
         flush_interval=None,
         max_queue_size=100,
         send_fn=reject,

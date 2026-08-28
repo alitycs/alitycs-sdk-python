@@ -38,8 +38,9 @@ does not change the identity used by any other call.
 Events are queued and dispatched in batches on a daemon flusher thread, so `track`
 never blocks on network I/O. Batches flush when `flush_size` (default 20) events are
 queued, every `flush_interval` seconds (default 2.0), or when you call `flush()` /
-`shutdown()` explicitly. On process exit a safety net drains live instances; SIGTERM
-and SIGINT also trigger a best-effort drain of live instances before the default
+`shutdown()` explicitly. `shutdown()` waits up to 30 seconds by default; pass
+`join_timeout=None` only when an unbounded drain is appropriate. On process exit a safety net
+drains live instances; SIGTERM and SIGINT also trigger a best-effort drain before the default
 termination disposition is restored (registered from the main thread only).
 
 ## Configuration
@@ -77,10 +78,10 @@ Alitycs(
 - SDK-generated exponential backoff is capped at 10 seconds. A server `Retry-After`
   replaces that generated delay and is not shortened to the client cap.
 - A new process using the same `persistence_path` replays retained bodies on
-  `flush()`/`shutdown()` and honors any remaining persisted `Retry-After` deadline. The WAL starts
-  immediately before the first network attempt, so it does not cover events still waiting in the
-  in-memory pre-flush queue and is capped at `max_queue_size` retained events. Use one client
-  process per path. After a fork, the child drops its
+  `flush()` (or an unbounded shutdown) and honors any remaining persisted `Retry-After` deadline.
+  If a finite shutdown deadline expires first, queued events are appended to the WAL in FIFO order.
+  The WAL starts immediately before the first network attempt and is capped at `max_queue_size`
+  retained events. Use one client process per path. After a fork, the child drops its
   copy of the parent-owned queue and detaches from the inherited WAL; create a fresh client with a
   child-specific path when child delivery also needs durability.
 

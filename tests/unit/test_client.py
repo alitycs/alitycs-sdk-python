@@ -133,6 +133,61 @@ class TestInstanceBasics:
         client.track("inline_doomed")  # must not raise despite the 500
         client.shutdown(join_timeout=2.0)
 
+    def test_inline_send_does_not_block_lifecycle_readers_or_shutdown_deadline(self, capture_server):
+        from alitycs.transport import SendSuccess
+
+        started = threading.Event()
+        release = threading.Event()
+        sent_names = []
+        client = Alitycs(
+            api_key="pk_inline_concurrency",
+            endpoint=capture_server.url,
+            batching=False,
+            max_retries=0,
+        )
+
+        def blocked_send(payload):
+            sent_names.extend(event.event for event in payload.events)
+            started.set()
+            release.wait(5)
+            return SendSuccess()
+
+        client._transport.send = blocked_send
+        sender = threading.Thread(target=lambda: client.track("blocked_inline"))
+        sender.start()
+        assert started.wait(2)
+
+        observed = []
+        reader_done = threading.Event()
+
+        def read_lifecycle() -> None:
+            observed.append(client.is_shutdown)
+            reader_done.set()
+
+        reader = threading.Thread(target=read_lifecycle)
+        reader.start()
+        assert reader_done.wait(0.5)
+        assert observed == [False]
+
+        shutdown_done = threading.Event()
+
+        def bounded_shutdown() -> None:
+            client.shutdown(join_timeout=0.05)
+            shutdown_done.set()
+
+        shutdown_thread = threading.Thread(target=bounded_shutdown)
+        shutdown_thread.start()
+        assert shutdown_done.wait(0.5)
+        assert client.is_shutdown is True
+        client.track("after_shutdown")
+        assert sent_names == ["blocked_inline"]
+
+        release.set()
+        sender.join(timeout=2)
+        reader.join(timeout=2)
+        shutdown_thread.join(timeout=2)
+        assert not sender.is_alive()
+
     def test_unreachable_flush_threshold_is_rejected(self, capture_server):
         with pytest.raises(ValueError, match="flush_size"):
             Alitycs(

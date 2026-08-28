@@ -6,6 +6,7 @@ import atexit
 import os
 import signal
 import threading
+import time
 from typing import Any, Dict, Mapping, Optional
 
 from .batch import BatchManager
@@ -34,7 +35,8 @@ class Alitycs:
 
     Events are queued and dispatched in batches on a daemon flusher thread, so
     ``track`` never blocks on network I/O. Call :meth:`flush` to pin a delivery point,
-    or :meth:`shutdown` before process exit — it drains fully and loses nothing.
+    or :meth:`shutdown` before process exit. A finite shutdown deadline persists queued
+    work when durability is enabled; pass ``join_timeout=None`` for an unbounded drain.
     """
 
     def __init__(
@@ -96,6 +98,8 @@ class Alitycs:
         # Guards identity and global property mutations across threads.
         self._identity_lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
+        self._inline_idle = threading.Condition(self._lifecycle_lock)
+        self._inline_inflight = 0
         self._closed = False
         self._user_id: Optional[str] = None
         self._global_properties: Dict[str, Any] = {}
@@ -223,14 +227,24 @@ class Alitycs:
         return self._batch_manager.flush(timeout)
 
     def shutdown(self, join_timeout: Optional[float] = _DEFAULT_SHUTDOWN_JOIN_TIMEOUT) -> None:
-        """Stop accepting events and drain fully. Safe to call from ``atexit``
-        handlers and more than once."""
-        with self._lifecycle_lock:
+        """Stop accepting events and drain within ``join_timeout``. Safe to call from
+        ``atexit`` handlers and more than once. Pass ``None`` to wait without a limit."""
+        deadline = None if join_timeout is None else time.monotonic() + max(0.0, join_timeout)
+        with self._inline_idle:
             already_closed = self._closed
             self._closed = True
+            while self._inline_inflight:
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                if remaining == 0.0:
+                    break
+                self._inline_idle.wait(remaining)
         if self._batch_manager is not None:
-            self._batch_manager.shutdown(join_timeout)
-        elif not already_closed:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            self._batch_manager.shutdown(remaining)
+        elif not already_closed and deadline is None:
+            # Finite shutdown never starts another potentially long recovery after the
+            # admitted inline sends finish. Failed durable sends remain in the WAL for
+            # the next explicit flush or process restart.
             self._transport.recover()
         _LIVE_INSTANCES.discard(self)
 
@@ -282,19 +296,25 @@ class Alitycs:
                 self._batch_manager.add(event)
         else:
             # Batching disabled: deliver inline; failures are reported, not hidden.
-            # Holding the lifecycle lock gives shutdown an exact admission boundary:
-            # either this inline delivery completes first, or it is refused below.
-            with self._lifecycle_lock:
+            # Admission is guarded, but network I/O happens outside the lifecycle lock
+            # so readers and shutdown are never serialized behind retries or backoff.
+            with self._inline_idle:
                 if self._closed:
                     if self._config.debug:
                         debug_warn("Client shut down — dropping event")
                     return
-                payload = BatchPayload(
-                    batch_id=f"batch_{generate_id()}",
-                    sent_at=now_ms(),
-                    events=[event],
-                )
+                self._inline_inflight += 1
+            payload = BatchPayload(
+                batch_id=f"batch_{generate_id()}",
+                sent_at=now_ms(),
+                events=[event],
+            )
+            try:
                 outcome = self._transport.send(payload)
+            finally:
+                with self._inline_idle:
+                    self._inline_inflight -= 1
+                    self._inline_idle.notify_all()
             if isinstance(outcome, SendRejected):
                 warn(f"Server rejected event {event.event_id} with HTTP {outcome.status}")
             elif isinstance(outcome, SendFailed):
@@ -308,6 +328,8 @@ class Alitycs:
         self._session_manager.reset_for_child()
         self._identity_lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
+        self._inline_idle = threading.Condition(self._lifecycle_lock)
+        self._inline_inflight = 0
 
 
 # Module-level convenience API over a default instance ----------------------------
@@ -399,9 +421,9 @@ def flush(timeout: Optional[float] = None) -> bool:
 
 
 def shutdown(**kwargs: Any) -> None:
-    """Shut down the default instance (drains fully). Safe to call more than once and
-    before :func:`init`; afterwards the module-level API raises until a new default
-    is created with :func:`init`."""
+    """Shut down the default instance within its configured deadline. Safe to call more
+    than once and before :func:`init`; afterwards the module-level API raises until a
+    new default is created with :func:`init`."""
     if _default_instance is not None:
         _default_instance.shutdown(**kwargs)
 

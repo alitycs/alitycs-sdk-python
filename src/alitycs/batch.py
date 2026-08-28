@@ -15,9 +15,9 @@ never repeat (see .agents/plans/phase-0-harness.md §1.1):
   batch) splits the payload in half and re-sends each half; a transient failure
   re-queues survivors at the head of the queue preserving order. Drained-but-
   undelivered events are never silently dropped.
-- :meth:`shutdown` marks the manager draining, joins the worker, and then flushes
-  again as a safety net. Whatever the app enqueued before ``shutdown()`` is delivered,
-  or the call does not return normally.
+- :meth:`shutdown` marks the manager draining and gives the worker a bounded window.
+  When that deadline expires, queued work is persisted when durability is enabled;
+  callers can pass ``join_timeout=None`` when they explicitly want an unbounded drain.
 """
 
 from __future__ import annotations
@@ -188,19 +188,32 @@ class BatchManager:
             return False
 
     def shutdown(self, join_timeout: Optional[float] = 30.0) -> None:
-        """Stop accepting events, drain everything, and join the worker. Returns only
-        once nothing is queued or in flight — shutdown must not lose events."""
+        """Stop accepting events and wait up to ``join_timeout`` for the worker.
+
+        When the deadline expires, queued events are persisted when durability is
+        enabled instead of extending process shutdown with unbounded network waits.
+        Passing ``None`` preserves the fully blocking drain contract.
+        """
+        deadline = None if join_timeout is None else self._clock() + max(0.0, join_timeout)
         with self._cv:
             self._stopping = True
             self._closed = True
             self._cv.notify_all()
             thread = self._thread
         if thread is not None and thread is not threading.current_thread():
-            thread.join(join_timeout)
-        # A timed-out join must not let the fallback snapshot race a worker that can
-        # still re-queue its in-flight batch after shutdown returns.
+            remaining = None if deadline is None else max(0.0, deadline - self._clock())
+            thread.join(remaining)
+
+        if deadline is not None:
+            # The worker owns network delivery. A finite shutdown must never re-enter
+            # that path inline because HTTP retries and Retry-After sleeps can outlive
+            # the caller's deadline. Any queued remainder is safe on disk when durable;
+            # an in-flight durable batch was persisted by the transport before sending.
+            self._persist_queued_for_shutdown()
+            return
+
+        # An explicitly unbounded shutdown retains the full drain guarantee.
         self._wait_for_inflight(None)
-        # Safety net: if the worker died or the join timed out, finish the drain inline.
         if not self.flush():
             self._persist_queued_for_shutdown()
 
