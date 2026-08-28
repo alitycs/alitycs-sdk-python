@@ -54,6 +54,11 @@ reviews:
       instructions: >-
         Preserve Python 3.9 compatibility, zero runtime dependencies, reproducible build metadata,
         and exact release-version alignment. Reject unbounded build requirements.
+    - path: "requirements-dev.txt"
+      instructions: >-
+        Preserve the complete hash-locked development toolchain. Require direct pinned entries and
+        hashes for every resolved artifact, reject unhashed or unexpected indexes and transitive
+        packages, and require the dependency-review and Snyk Open Source checks to pass.
     - path: ".coderabbit.yaml"
       instructions: >-
         Block changes that disable automatic or incremental review, request-changes behavior,
