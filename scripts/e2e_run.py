@@ -28,8 +28,36 @@ def main() -> int:
     api_key = os.environ["ALITYCS_API_KEY"]
     endpoint = os.environ["ALITYCS_ENDPOINT"]
     run_id = os.environ["ALITYCS_RUN_ID"]
+    phase = (os.environ.get("ALITYCS_E2E_PHASE") or "").strip()
+    state_file = (os.environ.get("ALITYCS_STATE_FILE") or "").strip() or None
+    if phase == "first":
+        endpoint = os.environ["ALITYCS_FAILURE_ENDPOINT"]
 
-    sdk = alitycs.init(api_key, endpoint=endpoint, flush_size=10, flush_interval=60.0)
+    sdk = alitycs.init(
+        api_key,
+        endpoint=endpoint,
+        flush_size=10,
+        flush_interval=60.0,
+        max_retries=0 if state_file else 3,
+        persistence_path=state_file,
+    )
+    if phase == "first":
+        sdk.set_global_properties(
+            {
+                "test_run_id": run_id,
+                "sdk_package": "python",
+                "scenario": "python-restart",
+            }
+        )
+        sdk.track(f"sdk_python_restart_{run_id}")
+        sdk.flush()
+        os._exit(0)
+    if phase == "restart":
+        if not sdk.flush():
+            print("persisted restart event was not delivered", file=sys.stderr)
+            return 1
+        sdk.shutdown()
+        return 0
     try:
         # The analytics query filters on these properties to find this run's rows.
         sdk.set_global_properties(
@@ -44,6 +72,14 @@ def main() -> int:
         sdk.track(
             f"sdk_python_track_{run_id}",
             {"source": "python-sdk-e2e", "value": 1},
+        )
+        sdk.track(
+            f"sdk_python_request_a_{run_id}",
+            user_id=f"sdk-python-request-a-{run_id}",
+        )
+        sdk.track(
+            f"sdk_python_request_b_{run_id}",
+            user_id=f"sdk-python-request-b-{run_id}",
         )
     finally:
         sdk.shutdown()

@@ -388,6 +388,23 @@ def test_pending_counts_queued_and_inflight():
         sent.release()
     assert manager.flush(timeout=5)
     assert manager.pending == 0
+
+
+def test_flush_reports_durable_background_failure_as_undelivered():
+    manager = BatchManager(
+        flush_size=1,
+        flush_interval=None,
+        max_queue_size=10,
+        send_fn=lambda payload: SendFailed("response lost", durable=True),
+        recover_fn=lambda: True,
+        durable_pending_fn=lambda: 1,
+        durable=True,
+    )
+    manager.add(make_event("durable_failure"))
+
+    assert manager.flush() is False
+    assert manager.pending >= 1
+    manager.shutdown()
     manager.shutdown()
 
 

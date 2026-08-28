@@ -24,6 +24,17 @@ client.page("settings")
 client.shutdown()
 ```
 
+For a client shared by concurrent server requests, scope identity to each event
+instead of changing ambient state with `identify()`:
+
+```python
+client.track("checkout_started", user_id=request.user_id)
+client.capture_error("checkout_failed", {"code": "E_CARD"}, user_id=request.user_id)
+```
+
+The same `user_id` keyword is accepted by `track_revenue()` and `page()` and
+does not change the identity used by any other call.
+
 Events are queued and dispatched in batches on a daemon flusher thread, so `track`
 never blocks on network I/O. Batches flush when `flush_size` (default 20) events are
 queued, every `flush_interval` seconds (default 2.0), or when you call `flush()` /
@@ -46,14 +57,16 @@ Alitycs(
     batching=True,               # False sends each event inline
     request_timeout=10.0,
     retry_backoff_base=1.0,
+    persistence_path=None,      # optional exact in-flight batch WAL file
 )
 ```
 
 ## Delivery guarantees
 
 - **Honest results**: `flush()` returns `True` only when every event was delivered.
-  Transient failures re-queue survivors at the head of the queue preserving order;
-  permanent refusals are dropped loudly.
+  Transient failures re-queue survivors at the head without persistence; with
+  `persistence_path`, the exact serialized in-flight batch remains on disk for restart.
+  Permanent refusals are dropped loudly.
 - **No silent loss**: delivery failures and local rejections are logged at warn level
   (never hidden behind `debug`) and counted — see `pending`, `rejected_locally`,
   plus `delivered_total` / `requeued_total` / `lost_total` on the batch manager.
@@ -61,6 +74,10 @@ Alitycs(
   an ingestion limit, so the SDK splits a rejected batch in half and retries each
   half until only invalid singles remain.
 - Retries reuse the exact batch body so `batchId` stays stable for server-side dedup.
+- A new process using the same `persistence_path` replays retained bodies on
+  `flush()`/`shutdown()` and honors any remaining persisted `Retry-After` deadline. The WAL starts
+  immediately before the first network attempt, so it does not cover events still waiting in the
+  in-memory pre-flush queue. Use one client process per path.
 
 ## Ingestion limits
 

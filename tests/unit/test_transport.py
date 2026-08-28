@@ -182,3 +182,52 @@ def test_final_failures_are_warned_even_when_debug_is_disabled(capture_factory, 
     captured = capsys.readouterr()
     assert "WARN" in captured.err
     assert "not retrying" in captured.err
+
+
+def test_persisted_batch_is_replayed_byte_identically_after_restart(capture_factory, tmp_path):
+    server = capture_factory(fail_on=(1,))
+    state_file = tmp_path / "alitycs-wal.json"
+    first = make_transport(server, max_retries=0, persistence_path=str(state_file))
+
+    outcome = first.send(make_payload("restart"))
+    assert isinstance(outcome, SendFailed)
+    assert outcome.durable is True
+    assert first.durable_pending_events == 1
+    assert state_file.exists()
+
+    restarted = make_transport(server, max_retries=0, persistence_path=str(state_file))
+    assert restarted.recover() is True
+    assert restarted.durable_pending_events == 0
+    assert server.requests[0]["raw"] == server.requests[1]["raw"]
+    assert not state_file.exists()
+
+
+def test_restart_honours_persisted_retry_after_deadline(capture_factory, tmp_path):
+    server = capture_factory(
+        responder=lambda request: (429, {"Retry-After": "3"}) if request["sequence"] == 1 else 202
+    )
+    state_file = tmp_path / "alitycs-wal.json"
+    first = make_transport(server, max_retries=0, persistence_path=str(state_file))
+    assert isinstance(first.send(make_payload("paused")), SendFailed)
+
+    sleeps: List[float] = []
+    restarted = make_transport(
+        server,
+        sleeps=sleeps,
+        max_retries=0,
+        persistence_path=str(state_file),
+    )
+    assert restarted.recover() is True
+    assert sleeps and sleeps[0] >= 2.5
+    assert server.requests[0]["raw"] == server.requests[1]["raw"]
+
+
+def test_corrupt_persistence_file_fails_initialization(tmp_path):
+    state_file = tmp_path / "alitycs-wal.json"
+    state_file.write_text("not-json", encoding="utf-8")
+    try:
+        HttpTransport("http://127.0.0.1:1/events", "pk", persistence_path=str(state_file))
+    except ValueError as error:
+        assert "Invalid Alitycs persistence file" in str(error)
+    else:  # pragma: no cover - assertion guard
+        raise AssertionError("corrupt persistence state must fail initialization")

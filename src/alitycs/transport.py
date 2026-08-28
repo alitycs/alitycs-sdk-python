@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import email.utils
 import json
+import threading
 import time
 import urllib.error
 import urllib.request
 from typing import Callable, Optional, Tuple, Union
 
+from .persistence import FileBatchStore
 from .types import BatchPayload
 from .utils import debug_warn, warn
 
@@ -52,11 +54,21 @@ class SendRejected:
 class SendFailed:
     """Transient failure: network error, timeout, or 429/5xx after all retries."""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(
+        self,
+        reason: str,
+        retry_after_until: Optional[float] = None,
+        durable: bool = False,
+    ) -> None:
         self.reason = reason
+        self.retry_after_until = retry_after_until
+        self.durable = durable
 
     def __repr__(self) -> str:
-        return f"SendFailed(reason={self.reason!r})"
+        return (
+            f"SendFailed(reason={self.reason!r}, retry_after_until={self.retry_after_until!r}, "
+            f"durable={self.durable!r})"
+        )
 
 
 SendOutcome = Union[SendSuccess, SendRejected, SendFailed]
@@ -74,6 +86,7 @@ class HttpTransport:
         retry_backoff_base: float = 1.0,
         debug: bool = False,
         sleep: Optional[Sleep] = None,
+        persistence_path: Optional[str] = None,
     ) -> None:
         self.endpoint = endpoint
         self.api_key = api_key
@@ -82,13 +95,43 @@ class HttpTransport:
         self.retry_backoff_base = retry_backoff_base
         self.debug = debug
         self._sleep: Sleep = sleep if sleep is not None else time.sleep
+        self._store = FileBatchStore(persistence_path)
+        self._delivery_lock = threading.RLock()
 
     def send(self, payload: BatchPayload) -> SendOutcome:
         """POST one batch until it succeeds, is rejected as non-retryable, or retries
         run out. Returns a :class:`SendOutcome`; never raises."""
         body = json.dumps(payload.to_dict(), separators=(",", ":")).encode("utf-8")
+        with self._delivery_lock:
+            self._store.put(payload.batch_id, body, len(payload.events))
+            return self._send_record(payload.batch_id, body)
+
+    def recover(self) -> bool:
+        """Replay persisted bodies exactly, honoring any remaining Retry-After pause."""
+        with self._delivery_lock:
+            for record in self._store.snapshot():
+                paused_until = record["paused_until"]
+                if paused_until is not None:
+                    remaining = max(0.0, paused_until - time.time())
+                    if remaining > 0:
+                        self._sleep(remaining)
+                outcome = self._send_record(record["batch_id"], record["body"].encode("utf-8"))
+                if not isinstance(outcome, SendSuccess):
+                    return False
+            return True
+
+    @property
+    def durable_pending_events(self) -> int:
+        return self._store.pending_events
+
+    @property
+    def durable_enabled(self) -> bool:
+        return self._store.enabled
+
+    def _send_record(self, batch_id: str, body: bytes) -> SendOutcome:
         last_error = "unknown error"
         retry_after: Optional[float] = None
+        retry_after_until: Optional[float] = None
 
         for attempt in range(self.max_retries + 1):
             if attempt > 0:
@@ -110,14 +153,23 @@ class HttpTransport:
                 continue
 
             if 200 <= status < 300:
+                self._store.acknowledge(batch_id)
                 return _SUCCESS
+            if 300 <= status < 400:
+                warn(f"Transport: HTTP {status} redirect — not retrying")
+                self._store.acknowledge(batch_id)
+                return SendRejected(status)
             if 400 <= status < 500 and status != 429:
                 warn(f"Transport: HTTP {status} — not retrying")
+                self._store.acknowledge(batch_id)
                 return SendRejected(status)
+            if status == 429:
+                retry_after_until = None if retry_after is None else time.time() + retry_after
             last_error = f"HTTP {status}"
 
-        warn(f"Transport: all retries exhausted — batch not delivered: {last_error}")
-        return SendFailed(last_error)
+        self._store.pause(batch_id, retry_after_until)
+        warn(f"Transport: all retries exhausted — batch retained for restart: {last_error}")
+        return SendFailed(last_error, retry_after_until, durable=self._store.enabled)
 
     def _post(self, body: bytes) -> Tuple[int, Optional[float]]:
         """Perform one POST and return ``(status, retry_after_seconds)`` without raising

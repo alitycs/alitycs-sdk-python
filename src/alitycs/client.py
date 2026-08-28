@@ -50,6 +50,7 @@ class Alitycs:
         batching: bool = True,
         request_timeout: float = 10.0,
         retry_backoff_base: float = 1.0,
+        persistence_path: Optional[str] = None,
     ) -> None:
         self._config = AlitycsConfig(
             api_key=api_key,
@@ -63,6 +64,7 @@ class Alitycs:
             batching=batching,
             request_timeout=request_timeout,
             retry_backoff_base=retry_backoff_base,
+            persistence_path=persistence_path,
         )
         self._transport = HttpTransport(
             endpoint=self._config.endpoint,
@@ -71,6 +73,7 @@ class Alitycs:
             request_timeout=self._config.request_timeout,
             retry_backoff_base=self._config.retry_backoff_base,
             debug=self._config.debug,
+            persistence_path=self._config.persistence_path,
         )
         self._session_manager = SessionManager(self._config.session_timeout)
         self._batch_manager: Optional[BatchManager] = (
@@ -80,6 +83,9 @@ class Alitycs:
                 max_queue_size=self._config.max_queue_size,
                 send_fn=self._transport.send,
                 debug=self._config.debug,
+                recover_fn=self._transport.recover,
+                durable_pending_fn=lambda: self._transport.durable_pending_events,
+                durable=self._transport.durable_enabled,
             )
             if self._config.batching
             else None
@@ -104,7 +110,7 @@ class Alitycs:
     def pending(self) -> int:
         """Events not yet delivered: queued plus in an in-flight send."""
         if self._batch_manager is None:
-            return 0
+            return self._transport.durable_pending_events
         return self._batch_manager.pending
 
     @property
@@ -207,7 +213,7 @@ class Alitycs:
         when every event was delivered; ``False`` when a send failed (survivors stay
         queued for a later flush) or a ``timeout`` was given and elapsed first."""
         if self._batch_manager is None:
-            return True
+            return self._transport.recover()
         return self._batch_manager.flush(timeout)
 
     def shutdown(self, join_timeout: Optional[float] = _DEFAULT_SHUTDOWN_JOIN_TIMEOUT) -> None:
@@ -215,6 +221,8 @@ class Alitycs:
         handlers and more than once."""
         if self._batch_manager is not None:
             self._batch_manager.shutdown(join_timeout)
+        else:
+            self._transport.recover()
         _LIVE_INSTANCES.discard(self)
 
     def _enqueue(

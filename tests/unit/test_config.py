@@ -90,3 +90,10 @@ def test_repr_masks_short_api_key():
     text = repr(config)
     assert "short" not in text
     assert "…hort" in text
+
+
+def test_persistence_path_must_be_non_blank_when_set():
+    assert AlitycsConfig(api_key="pk", persistence_path=None).persistence_path is None
+    assert AlitycsConfig(api_key="pk", persistence_path="/tmp/wal").persistence_path == "/tmp/wal"
+    with pytest.raises(ValueError, match="persistence_path"):
+        AlitycsConfig(api_key="pk", persistence_path="  ")

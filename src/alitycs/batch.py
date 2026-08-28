@@ -34,6 +34,8 @@ from .utils import debug_warn, generate_id, now_ms, warn
 #: Legacy fakes may return ``None``; that is treated as success.
 SendFn = Callable[[BatchPayload], Optional[Union[SendSuccess, SendRejected, SendFailed]]]
 Clock = Callable[[], float]
+RecoverFn = Callable[[], bool]
+DurablePendingFn = Callable[[], int]
 
 # Outcome of one dispatched batch.
 _OK = "ok"  # every event delivered
@@ -54,6 +56,9 @@ class BatchManager:
         send_fn: SendFn,
         debug: bool = False,
         clock: Optional[Clock] = None,
+        recover_fn: Optional[RecoverFn] = None,
+        durable_pending_fn: Optional[DurablePendingFn] = None,
+        durable: bool = False,
     ) -> None:
         self._flush_size = flush_size
         self._flush_interval = flush_interval
@@ -61,6 +66,9 @@ class BatchManager:
         self._send_fn = send_fn
         self._debug = debug
         self._clock: Clock = clock if clock is not None else time.monotonic
+        self._recover_fn = recover_fn
+        self._durable_pending_fn = durable_pending_fn
+        self._durable = durable
 
         self._cv = threading.Condition()
         self._queue: "deque[AnalyticsEvent]" = deque()
@@ -76,9 +84,11 @@ class BatchManager:
 
     @property
     def pending(self) -> int:
-        """Events queued plus events in an in-flight send."""
+        """Events queued, in flight, or persisted for restart."""
         with self._cv:
-            return len(self._queue) + self._inflight
+            memory_pending = len(self._queue) + self._inflight
+        durable_pending = 0 if self._durable_pending_fn is None else self._durable_pending_fn()
+        return memory_pending + durable_pending
 
     @property
     def closed(self) -> bool:
@@ -127,6 +137,8 @@ class BatchManager:
         ``False`` when a send failed (survivors stay queued), or ``timeout`` elapsed.
         Safe to call concurrently — callers share in-flight sends instead of
         duplicating them."""
+        if not self._recover_durable():
+            return False
         self._ensure_worker()
         deadline = None if timeout is None else self._clock() + timeout
         all_delivered = True
@@ -137,7 +149,10 @@ class BatchManager:
                 while True:
                     now = self._clock()
                     if not self._queue and self._inflight == 0:
-                        return all_delivered
+                        durable_pending = (
+                            0 if self._durable_pending_fn is None else self._durable_pending_fn()
+                        )
+                        return all_delivered and durable_pending == 0
                     if deadline is not None and now >= deadline:
                         return False
                     if self._queue:
@@ -244,7 +259,7 @@ class BatchManager:
         batch: List[AnalyticsEvent] = []
         while self._queue and len(batch) < count:
             batch.append(self._queue.popleft())
-        self._inflight += 1
+        self._inflight += len(batch)
         return batch
 
     def _timer_due(self, now: float) -> bool:
@@ -275,15 +290,29 @@ class BatchManager:
         """Dispatch one batch. Returns ``_OK``, ``_REJECTED``, or ``_TRANSIENT``
         (with survivors re-queued at the head). Never raises."""
         try:
-            result = self._deliver(list(batch))
+            if not self._recover_durable():
+                self._requeue_at_head(batch)
+                result = _TRANSIENT
+            else:
+                result = self._deliver(list(batch))
         except Exception as exc:  # noqa: BLE001 - delivery must never crash the host
             warn(f"Batch dispatch failed ({type(exc).__name__}: {exc})")
+            self._requeue_at_head(batch)
             result = _TRANSIENT
         finally:
             with self._cv:
-                self._inflight -= 1
+                self._inflight -= len(batch)
                 self._cv.notify_all()
         return result
+
+    def _recover_durable(self) -> bool:
+        if self._recover_fn is None:
+            return True
+        try:
+            return self._recover_fn()
+        except Exception as exc:  # noqa: BLE001 - persistence/network failures are reported
+            warn(f"Durable batch recovery failed ({type(exc).__name__}: {exc})")
+            return False
 
     def _deliver(self, events: List[AnalyticsEvent]) -> str:
         payload = BatchPayload(
@@ -316,8 +345,11 @@ class BatchManager:
             return _REJECTED
 
         if isinstance(outcome, SendFailed):
-            warn(f"Transport failure ({outcome.reason}) — re-queueing {len(events)} event(s)")
-            self._requeue_at_head(events)
+            if self._durable and outcome.durable:
+                warn(f"Transport failure ({outcome.reason}) — exact batch retained for restart")
+            else:
+                warn(f"Transport failure ({outcome.reason}) — re-queueing {len(events)} event(s)")
+                self._requeue_at_head(events)
             return _TRANSIENT
 
         if self._debug and outcome is not None and not isinstance(outcome, SendSuccess):
