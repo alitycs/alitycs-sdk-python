@@ -5,6 +5,14 @@ here before a version tag is created.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-28
+
+### Added
+- Optional `persistence_path` exact-batch write-ahead logging. A serialized in-flight batch is
+  stored atomically before its first attempt and replayed byte-identically after restart,
+  including any remaining final `Retry-After` deadline. Terminal responses acknowledge the WAL;
+  pre-flush in-memory events remain outside this durability boundary.
+
 ### Added
 - Config validation for `request_timeout`, `retry_backoff_base`, and `session_timeout` at
   construction time (positive, finite numbers; `request_timeout=None` is rejected — it would
@@ -56,3 +64,6 @@ here before a version tag is created.
   being dropped, and `False` is returned so callers can retry.
 - Transport failures and server rejections are logged at warn level even when `debug` is off;
   delivery problems were previously invisible by default.
+
+[Unreleased]: https://github.com/alitycs/alitycs-sdk-python/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/alitycs/alitycs-sdk-python/releases/tag/v1.0.0
