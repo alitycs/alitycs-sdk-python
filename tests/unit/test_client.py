@@ -188,6 +188,28 @@ class TestInstanceBasics:
         shutdown_thread.join(timeout=2)
         assert not sender.is_alive()
 
+    def test_unbounded_repeat_shutdown_recovers_inline_wal_after_finite_shutdown(
+        self, capture_factory, tmp_path
+    ):
+        state = {"status": 500}
+        server = capture_factory(responder=lambda request: state["status"])
+        client = Alitycs(
+            api_key="pk_inline_recovery",
+            endpoint=server.url,
+            batching=False,
+            max_retries=0,
+            persistence_path=str(tmp_path / "inline-wal.json"),
+        )
+
+        client.track("retained_inline")
+        assert client.pending == 1
+        client.shutdown(join_timeout=0.01)
+        assert client.pending == 1
+
+        state["status"] = 200
+        client.shutdown(join_timeout=None)
+        assert client.pending == 0
+
     def test_unreachable_flush_threshold_is_rejected(self, capture_server):
         with pytest.raises(ValueError, match="flush_size"):
             Alitycs(

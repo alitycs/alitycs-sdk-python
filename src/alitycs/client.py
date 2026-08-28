@@ -231,7 +231,6 @@ class Alitycs:
         ``atexit`` handlers and more than once. Pass ``None`` to wait without a limit."""
         deadline = None if join_timeout is None else time.monotonic() + max(0.0, join_timeout)
         with self._inline_idle:
-            already_closed = self._closed
             self._closed = True
             while self._inline_inflight:
                 remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
@@ -241,7 +240,7 @@ class Alitycs:
         if self._batch_manager is not None:
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
             self._batch_manager.shutdown(remaining)
-        elif not already_closed and deadline is None:
+        elif deadline is None:
             # Finite shutdown never starts another potentially long recovery after the
             # admitted inline sends finish. Failed durable sends remain in the WAL for
             # the next explicit flush or process restart.
