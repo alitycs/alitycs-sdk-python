@@ -145,10 +145,10 @@ def validate_event(event: Any) -> None:
             )
 
     estimated_size = (
-        len(event.user_id or "")
-        + len(event.anonymous_id or "")
-        + len(event.event)
-        + sum(len(key) + len(value) for key, value in properties.items())
+        len((event.user_id or "").encode("utf-8"))
+        + len((event.anonymous_id or "").encode("utf-8"))
+        + len(event.event.encode("utf-8"))
+        + sum(len(key.encode("utf-8")) + len(value.encode("utf-8")) for key, value in properties.items())
         + Limits.EVENT_SIZE_OVERHEAD
     )
     if estimated_size > Limits.MAX_EVENT_SIZE_BYTES:

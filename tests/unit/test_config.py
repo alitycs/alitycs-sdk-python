@@ -54,6 +54,12 @@ def test_max_retries_must_be_non_negative():
     assert AlitycsConfig(api_key="pk", max_retries=0).max_retries == 0
 
 
+def test_flush_size_must_fit_inside_queue_limit():
+    with pytest.raises(ValueError, match="flush_size"):
+        AlitycsConfig(api_key="pk", flush_size=11, max_queue_size=10)
+    assert AlitycsConfig(api_key="pk", flush_size=10, max_queue_size=10).flush_size == 10
+
+
 def test_flush_interval_must_be_positive_or_none():
     with pytest.raises(ValueError, match="flush_interval"):
         AlitycsConfig(api_key="pk", flush_interval=0)
@@ -90,3 +96,10 @@ def test_repr_masks_short_api_key():
     text = repr(config)
     assert "short" not in text
     assert "…hort" in text
+
+
+def test_persistence_path_must_be_non_blank_when_set():
+    assert AlitycsConfig(api_key="pk", persistence_path=None).persistence_path is None
+    assert AlitycsConfig(api_key="pk", persistence_path="/tmp/wal").persistence_path == "/tmp/wal"
+    with pytest.raises(ValueError, match="persistence_path"):
+        AlitycsConfig(api_key="pk", persistence_path="  ")

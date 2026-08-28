@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, fields
+from typing import Optional
 
 DEFAULT_ENDPOINT = "https://api.alitycs.com/events"
 
@@ -27,6 +28,7 @@ class AlitycsConfig:
     batching: bool = True
     request_timeout: float = 10.0
     retry_backoff_base: float = 1.0
+    persistence_path: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.api_key, str) or not self.api_key.strip():
@@ -35,6 +37,8 @@ class AlitycsConfig:
             raise ValueError("endpoint is required")
         _require_positive_int(self, "flush_size")
         _require_positive_int(self, "max_queue_size")
+        if self.flush_size > self.max_queue_size:
+            raise ValueError("flush_size must not exceed max_queue_size")
         if not isinstance(self.max_retries, int) or isinstance(self.max_retries, bool) or self.max_retries < 0:
             raise ValueError("max_retries must be a non-negative integer")
         if self.flush_interval is not None and self.flush_interval <= 0:
@@ -42,6 +46,10 @@ class AlitycsConfig:
         _require_positive_number(self, "request_timeout")
         _require_positive_number(self, "retry_backoff_base")
         _require_positive_number(self, "session_timeout")
+        if self.persistence_path is not None and (
+            not isinstance(self.persistence_path, str) or not self.persistence_path.strip()
+        ):
+            raise ValueError("persistence_path must be None or a non-empty string")
 
     def __repr__(self) -> str:
         # Mask the api_key so logging a config (or an exception carrying one) can never

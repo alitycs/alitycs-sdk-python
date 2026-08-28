@@ -7,9 +7,10 @@ Every test drives the public :class:`Alitycs` client through real sockets —
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List
 
-from alitycs import Alitycs
+from alitycs import Alitycs, RevenuePayload
 from tests.conftest import CaptureServer
 
 
@@ -111,6 +112,54 @@ def test_session_and_anonymous_id_are_stable_across_events(capture_server):
     assert user_ids == {"usr_stable"}
     assert all(event["anonymousId"].startswith("anon_") for event in events)
     assert all(event["sessionId"].startswith("sess_") for event in events)
+
+
+def test_shared_client_keeps_concurrent_per_call_users_isolated(capture_server):
+    client = make_client(capture_server, flush_size=1000)
+
+    def emit(prefix: str, user_id: str, index: int) -> None:
+        client.track(f"{prefix}_{index}", user_id=user_id)
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        futures = [
+            executor.submit(emit, prefix, user_id, index)
+            for index in range(50)
+            for prefix, user_id in (
+                ("request_a", "usr_request_a"),
+                ("request_b", "usr_request_b"),
+            )
+        ]
+        for future in futures:
+            future.result()
+
+    assert client.flush()
+    assert len(capture_server.events) == 100
+    for event in capture_server.events:
+        expected = "usr_request_a" if event["event"].startswith("request_a_") else "usr_request_b"
+        assert event["userId"] == expected, event["event"]
+    client.shutdown()
+
+
+def test_per_call_user_applies_to_every_event_api(capture_server):
+    client = make_client(capture_server, flush_size=10)
+
+    client.track("scoped_track", user_id="usr_track")
+    client.capture_error("scoped_error", user_id="usr_error")
+    client.page("scoped_page", user_id="usr_page")
+    client.track_revenue(
+        RevenuePayload.transaction("scoped_fact", "5.00", "USD"),
+        user_id="usr_revenue",
+    )
+    assert client.flush()
+
+    users_by_event = {event["event"]: event["userId"] for event in capture_server.events}
+    assert users_by_event == {
+        "scoped_track": "usr_track",
+        "scoped_error": "usr_error",
+        "scoped_page": "usr_page",
+        "revenue_transaction": "usr_revenue",
+    }
+    client.shutdown()
 
 
 def test_session_rotates_after_inactivity_but_keeps_anonymous_id(capture_server):

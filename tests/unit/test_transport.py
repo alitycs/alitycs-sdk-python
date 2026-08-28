@@ -1,7 +1,13 @@
+import os
+import subprocess
+import sys
 import time
 from email.utils import formatdate
 from typing import List, Optional
 
+import pytest
+
+from alitycs.persistence import FileBatchStore
 from alitycs.transport import HttpTransport, SendFailed, SendRejected, SendSuccess, parse_retry_after
 from alitycs.types import AnalyticsEvent, BatchPayload, EventContext, EventType
 from tests.conftest import CaptureServer
@@ -120,14 +126,14 @@ def test_429_retry_after_http_date_is_honoured(capture_factory):
     assert 2.0 <= sleeps[0] <= 3.0
 
 
-def test_429_retry_after_is_capped_at_ten_seconds(capture_factory):
+def test_429_retry_after_is_not_shortened_to_client_backoff_cap(capture_factory):
     responses = iter([(429, {"Retry-After": "3600"}), 202])
     server = capture_factory(responder=lambda request: next(responses))
     sleeps: List[float] = []
     transport = make_transport(server, sleeps=sleeps, max_retries=1)
     transport.send(make_payload())
 
-    assert sleeps == [10.0]
+    assert sleeps == [3600.0]
 
 
 def test_parse_retry_after_variants():
@@ -136,11 +142,15 @@ def test_parse_retry_after_variants():
     assert parse_retry_after({}) is None
     assert parse_retry_after(None) is None
     assert parse_retry_after({"Retry-After": "soon"}) is None
+    assert parse_retry_after({"Retry-After": "1.5"}) is None
     # A date in the past clamps to zero instead of going negative.
     past = formatdate(time.time() - 60, usegmt=True)
     assert parse_retry_after({"Retry-After": past}) == 0.0
     future = formatdate(time.time() + 30, usegmt=True)
     assert 28.0 <= parse_retry_after({"Retry-After": future}) <= 30.0
+    assert parse_retry_after({"Retry-After": "100000000"}) == 3600.0
+    far_future = formatdate(time.time() + 7200, usegmt=True)
+    assert parse_retry_after({"Retry-After": far_future}) == 3600.0
 
 
 def test_exhausted_retries_drop_the_batch_without_raising(capture_factory):
@@ -182,3 +192,303 @@ def test_final_failures_are_warned_even_when_debug_is_disabled(capture_factory, 
     captured = capsys.readouterr()
     assert "WARN" in captured.err
     assert "not retrying" in captured.err
+
+
+def test_persisted_batch_is_replayed_byte_identically_after_restart(capture_factory, tmp_path):
+    server = capture_factory(fail_on=(1,))
+    state_file = tmp_path / "alitycs-wal.json"
+    first = make_transport(server, max_retries=0, persistence_path=str(state_file))
+
+    outcome = first.send(make_payload("restart"))
+    assert isinstance(outcome, SendFailed)
+    assert outcome.durable is True
+    assert first.durable_pending_events == 1
+    assert state_file.exists()
+    first.close()
+
+    restarted = make_transport(server, max_retries=0, persistence_path=str(state_file))
+    assert restarted.recover() is True
+    assert restarted.durable_pending_events == 0
+    assert server.requests[0]["raw"] == server.requests[1]["raw"]
+    assert not state_file.exists()
+
+
+def test_persist_stores_without_network_then_recovery_delivers(capture_server, tmp_path):
+    state_file = tmp_path / "alitycs-wal.json"
+    transport = make_transport(capture_server, max_retries=0, persistence_path=str(state_file))
+    payload = make_payload("shutdown")
+
+    assert transport.persist(payload) is True
+    assert transport.durable_pending_events == 1
+    assert capture_server.requests == []
+
+    assert transport.recover() is True
+    assert transport.durable_pending_events == 0
+    assert capture_server.requests[0]["payload"]["batchId"] == payload.batch_id
+
+
+def test_durable_pending_snapshot_reports_active_overlap(capture_server, tmp_path):
+    transport = make_transport(
+        capture_server,
+        max_retries=0,
+        persistence_path=str(tmp_path / "pending-snapshot-wal.json"),
+    )
+    payload = make_payload("snapshot")
+
+    assert transport.persist(payload) is True
+    assert transport.durable_pending_snapshot([payload.batch_id]) == (1, 1)
+    assert transport.durable_pending_snapshot(["batch_elsewhere"]) == (1, 0)
+    transport.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX persistence parent validation")
+def test_unavailable_persistence_parent_fails_initialization_without_network(
+    capture_server, tmp_path
+):
+    parent_file = tmp_path / "parent-file"
+    parent_file.write_text("not a directory", encoding="utf-8")
+    with pytest.raises(ValueError, match="unavailable"):
+        make_transport(
+            capture_server,
+            max_retries=0,
+            persistence_path=str(parent_file / "wal.json"),
+        )
+    assert capture_server.requests == []
+
+
+def test_restart_honours_persisted_retry_after_deadline(capture_factory, tmp_path):
+    server = capture_factory(
+        responder=lambda request: (429, {"Retry-After": "3"}) if request["sequence"] == 1 else 202
+    )
+    state_file = tmp_path / "alitycs-wal.json"
+    first = make_transport(server, max_retries=0, persistence_path=str(state_file))
+    assert isinstance(first.send(make_payload("paused")), SendFailed)
+    first.close()
+
+    sleeps: List[float] = []
+    restarted = make_transport(
+        server,
+        sleeps=sleeps,
+        max_retries=0,
+        persistence_path=str(state_file),
+    )
+    assert restarted.recover() is True
+    assert sleeps and sleeps[0] >= 2.5
+    assert server.requests[0]["raw"] == server.requests[1]["raw"]
+
+
+def test_corrupt_persistence_file_fails_initialization(tmp_path):
+    state_file = tmp_path / "alitycs-wal.json"
+    state_file.write_text("not-json", encoding="utf-8")
+    try:
+        HttpTransport("http://127.0.0.1:1/events", "pk", persistence_path=str(state_file))
+    except ValueError as error:
+        assert "Invalid Alitycs persistence file" in str(error)
+    else:  # pragma: no cover - assertion guard
+        raise AssertionError("corrupt persistence state must fail initialization")
+
+
+def test_terminal_recovery_acknowledges_and_continues(capture_factory, tmp_path):
+    state_file = tmp_path / "alitycs-wal.json"
+    store = FileBatchStore(str(state_file))
+    store.put("batch_rejected", b'{"batchId":"batch_rejected"}', 1)
+    store.put("batch_healthy", b'{"batchId":"batch_healthy"}', 1)
+    store.close()
+    responses = iter([400, 202])
+    server = capture_factory(responder=lambda request: next(responses))
+    transport = make_transport(server, max_retries=0, persistence_path=str(state_file))
+
+    assert transport.recover() is True
+    assert len(server.requests) == 2
+    assert transport.durable_pending_events == 0
+
+
+def test_retry_after_from_503_is_persisted_and_honoured_after_restart(
+    capture_factory, tmp_path
+):
+    server = capture_factory(
+        responder=lambda request: (503, {"Retry-After": "300"})
+        if request["sequence"] == 1
+        else 202
+    )
+    state_file = tmp_path / "alitycs-wal.json"
+    first = make_transport(server, max_retries=0, persistence_path=str(state_file))
+    outcome = first.send(make_payload("paused-503"))
+    assert isinstance(outcome, SendFailed)
+    assert outcome.retry_after_until is not None
+    first.close()
+
+    sleeps: List[float] = []
+    restarted = make_transport(
+        server,
+        sleeps=sleeps,
+        max_retries=0,
+        persistence_path=str(state_file),
+    )
+    assert restarted.recover() is True
+    assert sleeps and 299.0 <= sleeps[0] <= 300.0
+
+
+def test_recover_returns_before_pause_that_outlives_deadline(capture_factory, tmp_path):
+    server = capture_factory(responder=lambda request: (429, {"Retry-After": "300"}))
+    state_file = tmp_path / "alitycs-wal.json"
+    first = make_transport(server, max_retries=0, persistence_path=str(state_file))
+    assert isinstance(first.send(make_payload("deadline")), SendFailed)
+    first.close()
+
+    sleeps: List[float] = []
+    restarted = make_transport(
+        server,
+        sleeps=sleeps,
+        max_retries=0,
+        persistence_path=str(state_file),
+    )
+    started_at = time.monotonic()
+    assert restarted.recover(time.monotonic() + 0.05) is False
+    assert time.monotonic() - started_at < 0.5
+    assert sleeps == []
+    assert len(server.requests) == 1
+    assert restarted.durable_pending_events == 1
+
+
+def test_send_deadline_skips_retry_after_sleep_and_retains_batch(capture_factory, tmp_path):
+    server = capture_factory(responder=lambda request: (429, {"Retry-After": "300"}))
+    sleeps: List[float] = []
+    transport = make_transport(
+        server,
+        sleeps=sleeps,
+        max_retries=1,
+        persistence_path=str(tmp_path / "alitycs-wal.json"),
+    )
+
+    outcome = transport.send(make_payload("bounded"), time.monotonic() + 0.05)
+
+    assert isinstance(outcome, SendFailed)
+    assert outcome.durable is True
+    assert sleeps == []
+    assert len(server.requests) == 1
+    assert transport.durable_pending_events == 1
+
+
+def test_fork_reset_detaches_child_without_removing_parent_wal(capture_factory, tmp_path):
+    state_file = tmp_path / "alitycs-wal.json"
+    server = capture_factory(fail_on=(1,))
+    transport = make_transport(server, max_retries=0, persistence_path=str(state_file))
+    assert isinstance(transport.send(make_payload("parent")), SendFailed)
+
+    transport.reset_for_child()
+
+    assert transport.durable_enabled is False
+    assert transport.durable_pending_events == 0
+    assert state_file.exists()
+
+
+def test_store_rolls_back_memory_when_persist_fails(monkeypatch, tmp_path):
+    store = FileBatchStore(str(tmp_path / "alitycs-wal.json"))
+
+    def fail() -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store, "_persist", fail)
+    with pytest.raises(OSError, match="disk full"):
+        store.put("batch_new", b"{}", 3)
+    assert store.pending_events == 0
+
+
+@pytest.mark.parametrize(
+    "paused_until",
+    [float("nan"), float("inf"), float("-inf"), 10**10000],
+    ids=["nan", "positive-infinity", "negative-infinity", "oversized-integer"],
+)
+def test_store_rejects_non_finite_pause_without_mutating_wal(tmp_path, paused_until):
+    state_file = tmp_path / "alitycs-wal.json"
+    store = FileBatchStore(str(state_file))
+    store.put("batch", b"{}", 1)
+    original = state_file.read_bytes()
+
+    with pytest.raises(ValueError, match="finite"):
+        store.pause("batch", paused_until)
+
+    assert store.snapshot()[0]["paused_until"] is None
+    assert state_file.read_bytes() == original
+
+
+def test_store_pending_event_limit_bounds_wal_growth(tmp_path):
+    store = FileBatchStore(str(tmp_path / "alitycs-wal.json"), max_pending_events=2)
+    store.put("batch_first", b"{}", 2)
+    with pytest.raises(ValueError, match="event limit"):
+        store.put("batch_overflow", b"{}", 1)
+    assert store.pending_events == 2
+
+
+def test_store_rejects_overlapping_live_owners_and_allows_reopen_after_close(tmp_path):
+    state_file = tmp_path / "alitycs-wal.json"
+    first = FileBatchStore(str(state_file))
+
+    with pytest.raises(ValueError, match="already in use"):
+        FileBatchStore(str(state_file))
+
+    first.close()
+    reopened = FileBatchStore(str(state_file))
+    reopened.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX advisory lock")
+def test_store_rejects_cross_process_owner(tmp_path):
+    state_file = tmp_path / "alitycs-wal.json"
+    first = FileBatchStore(str(state_file))
+    script = """
+import sys
+from alitycs.persistence import FileBatchStore
+
+try:
+    store = FileBatchStore(sys.argv[1])
+except ValueError:
+    raise SystemExit(17)
+store.close()
+"""
+
+    blocked = subprocess.run([sys.executable, "-c", script, str(state_file)], check=False)
+    assert blocked.returncode == 17
+
+    first.close()
+    reopened = subprocess.run([sys.executable, "-c", script, str(state_file)], check=False)
+    assert reopened.returncode == 0
+
+
+def test_store_rejects_invalid_or_oversized_persistence_limit(tmp_path):
+    with pytest.raises(ValueError, match="positive"):
+        FileBatchStore(None, max_pending_events=0)
+
+    state_file = tmp_path / "alitycs-wal.json"
+    state_file.write_text(
+        '{"version":1,"batches":[{"batch_id":"batch","body":"{}",'
+        '"event_count":2,"paused_until":null}]}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Invalid Alitycs persistence file"):
+        FileBatchStore(str(state_file), max_pending_events=1)
+
+
+@pytest.mark.parametrize(
+    "batches",
+    [
+        [{"batch_id": 42, "body": "{}", "event_count": 1, "paused_until": None}],
+        [{"batch_id": "batch", "body": {}, "event_count": 1, "paused_until": None}],
+        [{"batch_id": "batch", "body": "{}", "event_count": True, "paused_until": None}],
+        [{"batch_id": "batch", "body": "{}", "event_count": 1, "paused_until": float("inf")}],
+        [{"batch_id": "batch", "body": "{}", "event_count": 1, "paused_until": 10**4000}],
+        [
+            {"batch_id": "duplicate", "body": "{}", "event_count": 1, "paused_until": None},
+            {"batch_id": "duplicate", "body": "{}", "event_count": 1, "paused_until": None},
+        ],
+    ],
+)
+def test_store_rejects_invalid_and_duplicate_records(tmp_path, batches):
+    import json
+
+    state_file = tmp_path / "alitycs-wal.json"
+    state_file.write_text(json.dumps({"version": 1, "batches": batches}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Invalid Alitycs persistence file"):
+        FileBatchStore(str(state_file))

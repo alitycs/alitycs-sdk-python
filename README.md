@@ -24,11 +24,24 @@ client.page("settings")
 client.shutdown()
 ```
 
-Events are queued and dispatched in batches on a daemon flusher thread, so `track`
-never blocks on network I/O. Batches flush when `flush_size` (default 20) events are
-queued, every `flush_interval` seconds (default 2.0), or when you call `flush()` /
-`shutdown()` explicitly. On process exit a safety net drains live instances; SIGTERM
-and SIGINT also trigger a best-effort drain of live instances before the default
+For a client shared by concurrent server requests, scope identity to each event
+instead of changing ambient state with `identify()`:
+
+```python
+client.track("checkout_started", user_id=request.user_id)
+client.capture_error("checkout_failed", {"code": "E_CARD"}, user_id=request.user_id)
+```
+
+The same `user_id` keyword is accepted by `track_revenue()` and `page()` and
+does not change the identity used by any other call.
+
+With batching enabled (the default), events are queued and dispatched on a daemon flusher thread,
+so `track` does not block on network I/O. With `batching=False`, each `track` call sends inline and
+can block up to the configured request/retry limits. Batches flush when `flush_size` (default 20)
+events are queued, every `flush_interval` seconds (default 2.0), or when you call `flush()` /
+`shutdown()` explicitly. `shutdown()` waits up to 30 seconds by default; pass
+`join_timeout=None` only when an unbounded drain is appropriate. On process exit a safety net
+drains live instances; SIGTERM and SIGINT also trigger a best-effort drain before the default
 termination disposition is restored (registered from the main thread only).
 
 ## Configuration
@@ -46,21 +59,33 @@ Alitycs(
     batching=True,               # False sends each event inline
     request_timeout=10.0,
     retry_backoff_base=1.0,
+    persistence_path=None,       # optional exact in-flight batch WAL file
 )
 ```
 
 ## Delivery guarantees
 
 - **Honest results**: `flush()` returns `True` only when every event was delivered.
-  Transient failures re-queue survivors at the head of the queue preserving order;
-  permanent refusals are dropped loudly.
+  Transient failures re-queue survivors at the head without persistence; with
+  `persistence_path`, the exact serialized in-flight batch remains on disk for restart.
+  Permanent refusals are dropped loudly.
 - **No silent loss**: delivery failures and local rejections are logged at warn level
   (never hidden behind `debug`) and counted — see `pending`, `rejected_locally`,
   plus `delivered_total` / `requeued_total` / `lost_total` on the batch manager.
-- **Split-on-rejection**: the server rejects an entire batch when one event violates
-  an ingestion limit, so the SDK splits a rejected batch in half and retries each
-  half until only invalid singles remain.
+- **Split-on-rejection**: an HTTP 400 can mean one event poisoned a whole batch, so the
+  SDK splits that response in half to isolate valid events, with a hard cap of 64 sends.
+  Authentication, authorization, redirect, and other permanent responses are never split.
 - Retries reuse the exact batch body so `batchId` stays stable for server-side dedup.
+- SDK-generated exponential backoff is capped at 10 seconds. A server `Retry-After`
+  replaces that generated delay and is capped at one hour to keep delivery bounded.
+- A new process using the same `persistence_path` replays retained bodies on
+  `flush()` (or an unbounded shutdown) and honors any remaining persisted `Retry-After` deadline.
+  If a finite shutdown deadline expires first, queued events are appended to the WAL in FIFO order.
+  The WAL starts immediately before the first network attempt and is capped at `max_queue_size`
+  retained events. Each path is exclusively owned by one live client; a same-process registry and
+  a POSIX advisory lock reject overlapping owners. After a fork, the child drops its
+  copy of the parent-owned queue and detaches from the inherited WAL; create a fresh client with a
+  child-specific path when child delivery also needs durability.
 
 ## Ingestion limits
 

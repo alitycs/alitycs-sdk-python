@@ -7,7 +7,7 @@ Quickstart::
     alitycs.init("pk_...", flush_size=20, flush_interval=2.0)
     alitycs.identify("usr_123", {"plan": "pro"})
     alitycs.track("checkout_completed", {"total": "19.99"})
-    alitycs.shutdown()  # drains fully; nothing queued is lost
+    alitycs.shutdown()  # bounded drain; configure persistence for restart safety
 
 Zero runtime dependencies — HTTP goes through ``urllib.request``.
 """

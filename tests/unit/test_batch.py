@@ -5,7 +5,7 @@ import time
 from typing import List
 
 from alitycs.batch import BatchManager
-from alitycs.transport import SendFailed, SendRejected
+from alitycs.transport import SendFailed, SendRejected, SendSuccess
 from alitycs.types import AnalyticsEvent, BatchPayload, EventContext, EventType
 
 
@@ -149,6 +149,46 @@ def test_flush_resolves_only_after_the_in_flight_send_lands():
     assert manager.pending == 0
 
 
+def test_durable_pending_counts_an_active_persisted_batch_once():
+    started = threading.Event()
+    release = threading.Event()
+    records = {}
+    records_lock = threading.Lock()
+
+    def send(payload: BatchPayload):
+        with records_lock:
+            records[payload.batch_id] = len(payload.events)
+        started.set()
+        release.wait(5)
+        with records_lock:
+            records.pop(payload.batch_id, None)
+        return SendSuccess()
+
+    def pending_snapshot(active_batch_ids):
+        with records_lock:
+            total = sum(records.values())
+            overlap = sum(records.get(batch_id, 0) for batch_id in active_batch_ids)
+            return total, overlap
+
+    manager = BatchManager(
+        flush_size=1,
+        flush_interval=None,
+        max_queue_size=10,
+        send_fn=send,
+        durable=True,
+        durable_pending_snapshot_fn=pending_snapshot,
+    )
+    manager.add(make_event("durable-active"))
+    assert started.wait(2)
+
+    assert manager.pending == 1
+
+    release.set()
+    assert manager.flush(timeout=2)
+    assert manager.pending == 0
+    manager.shutdown()
+
+
 def test_shutdown_drains_everything_queued():
     sent = SentBatches()
     manager = make_manager(sent, flush_size=10)
@@ -169,6 +209,121 @@ def test_shutdown_rejects_new_events_and_is_idempotent():
     assert manager.add(make_event("b")) is False
     manager.shutdown()  # second call is a no-op, not an error
     assert sent.event_names == ["a"]
+
+
+def test_shutdown_deadline_persists_queued_remainder_while_send_is_blocked():
+    started = threading.Event()
+    release = threading.Event()
+    persisted = []
+
+    def blocked_send(payload: BatchPayload) -> None:
+        started.set()
+        release.wait(5)
+
+    def persist(payload: BatchPayload) -> bool:
+        persisted.append(payload)
+        return True
+
+    manager = BatchManager(
+        flush_size=1,
+        flush_interval=None,
+        max_queue_size=10,
+        send_fn=blocked_send,
+        durable=True,
+        persist_fn=persist,
+    )
+    manager.add(make_event("in-flight"))
+    assert started.wait(2)
+    manager.add(make_event("queued"))
+
+    started_at = time.monotonic()
+    manager.shutdown(join_timeout=0.05)
+    elapsed = time.monotonic() - started_at
+
+    assert elapsed < 0.5
+    assert [[event.event for event in payload.events] for payload in persisted] == [["queued"]]
+
+    release.set()
+    manager.shutdown(join_timeout=None)
+
+
+def test_non_durable_failure_after_shutdown_deadline_is_counted_as_lost():
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked_failure(payload: BatchPayload):
+        started.set()
+        release.wait(5)
+        return SendFailed("still down")
+
+    manager = BatchManager(
+        flush_size=1,
+        flush_interval=None,
+        max_queue_size=10,
+        send_fn=blocked_failure,
+    )
+    manager.add(make_event("in-flight"))
+    assert started.wait(2)
+
+    manager.shutdown(join_timeout=0.05)
+    release.set()
+    deadline = time.monotonic() + 2
+    while manager._worker_alive() and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+    assert not manager._worker_alive()
+    assert manager.pending == 0
+    assert manager.requeued_total == 0
+    assert manager.lost_total == 1
+
+
+def test_unbounded_repeat_shutdown_can_resume_a_timed_out_inflight_send():
+    started = threading.Event()
+    release = threading.Event()
+    attempts = {"count": 0}
+
+    def blocked_then_good(payload: BatchPayload):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            started.set()
+            release.wait(5)
+            return SendFailed("still down")
+        return None
+
+    manager = BatchManager(
+        flush_size=1,
+        flush_interval=None,
+        max_queue_size=10,
+        send_fn=blocked_then_good,
+    )
+    manager.add(make_event("retry-me"))
+    assert started.wait(2)
+    manager.shutdown(join_timeout=0.05)
+
+    finished = threading.Event()
+
+    def drain() -> None:
+        manager.shutdown(join_timeout=None)
+        finished.set()
+
+    drainer = threading.Thread(target=drain)
+    drainer.start()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        with manager._cv:
+            if not manager._finite_shutdown_complete:
+                break
+        time.sleep(0.001)
+    else:  # pragma: no cover - assertion guard
+        raise AssertionError("unbounded shutdown did not resume draining")
+    release.set()
+
+    assert finished.wait(2)
+    drainer.join(timeout=2)
+    assert attempts["count"] == 2
+    assert manager.delivered_total == 1
+    assert manager.requeued_total == 1
+    assert manager.lost_total == 0
 
 
 def test_flush_after_shutdown_still_drains_stragglers_inline():
@@ -362,16 +517,37 @@ def test_flush_reports_false_until_everything_is_delivered():
     manager.shutdown()
 
 
-def test_reset_for_child_preserves_queue_and_forgets_worker():
+def test_reset_for_child_drops_parent_owned_queue_and_forgets_worker():
     sent = SentBatches()
     manager = make_manager(sent, flush_size=100)
     manager.add(make_event("inherited"))
     manager.reset_for_child()
     assert manager._thread is None
-    assert manager.pending == 1  # queued events survive into the child
+    assert manager.pending == 0
 
     assert manager.flush(timeout=5)
-    assert sent.event_names == ["inherited"]
+    assert sent.event_names == []
+    manager.shutdown()
+
+
+def test_batch_rejection_split_is_bounded_to_sixty_four_sends():
+    sent = []
+
+    def reject(payload: BatchPayload):
+        sent.append(payload)
+        return SendRejected(400)
+
+    manager = BatchManager(
+        flush_size=101,  # above the event count: only the explicit flush dispatches
+        flush_interval=None,
+        max_queue_size=100,
+        send_fn=reject,
+    )
+    for index in range(100):
+        manager.add(make_event(str(index)))
+    assert manager.flush(timeout=5) is False
+    assert len(sent) == 64
+    assert manager.lost_total == 100
     manager.shutdown()
 
 
@@ -388,7 +564,88 @@ def test_pending_counts_queued_and_inflight():
         sent.release()
     assert manager.flush(timeout=5)
     assert manager.pending == 0
+
+
+def test_flush_reports_durable_background_failure_as_undelivered():
+    manager = BatchManager(
+        flush_size=1,
+        flush_interval=None,
+        max_queue_size=10,
+        send_fn=lambda payload: SendFailed("response lost", durable=True),
+        recover_fn=lambda deadline: True,
+        durable_pending_fn=lambda: 1,
+        durable=True,
+    )
+    manager.add(make_event("durable_failure"))
+
+    assert manager.flush() is False
+    assert manager.pending >= 1
     manager.shutdown()
+    manager.shutdown()
+
+
+def test_shutdown_persists_queued_events_fifo_when_recovery_is_blocked():
+    durable_pending = [1]
+    persisted = []
+
+    def persist(payload: BatchPayload) -> bool:
+        persisted.append(payload)
+        durable_pending[0] += len(payload.events)
+        return True
+
+    manager = BatchManager(
+        flush_size=10,
+        flush_interval=None,
+        max_queue_size=10,
+        send_fn=lambda payload: None,
+        recover_fn=lambda deadline: False,
+        durable_pending_fn=lambda: durable_pending[0],
+        durable=True,
+        persist_fn=persist,
+    )
+    for name in ("a", "b", "c"):
+        manager.add(make_event(name))
+
+    manager.shutdown(join_timeout=2)
+
+    assert [[event.event for event in payload.events] for payload in persisted] == [
+        ["a"],
+        ["b"],
+        ["c"],
+    ]
+    assert manager.pending == 4
+    assert manager.lost_total == 0
+
+
+def test_shutdown_counts_only_unpersisted_suffix_as_lost():
+    durable_pending = [1]
+    persisted = []
+
+    def persist(payload: BatchPayload) -> bool:
+        if persisted:
+            return False
+        persisted.append(payload)
+        durable_pending[0] += 1
+        return True
+
+    manager = BatchManager(
+        flush_size=10,
+        flush_interval=None,
+        max_queue_size=10,
+        send_fn=lambda payload: None,
+        recover_fn=lambda deadline: False,
+        durable_pending_fn=lambda: durable_pending[0],
+        durable=True,
+        persist_fn=persist,
+    )
+    for name in ("saved", "lost-1", "lost-2"):
+        manager.add(make_event(name))
+
+    manager.shutdown(join_timeout=2)
+
+    assert [event.event for event in persisted[0].events] == ["saved"]
+    assert manager.pending == 2
+    assert manager.lost_total == 2
 
 
 def test_send_failure_keeps_events_queued_and_reports_false():

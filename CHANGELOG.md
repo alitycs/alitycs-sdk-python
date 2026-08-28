@@ -5,7 +5,15 @@ here before a version tag is created.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-28
+
 ### Added
+
+- Optional `persistence_path` exact-batch write-ahead logging. A serialized in-flight batch is
+  stored atomically before its first attempt and replayed byte-identically after restart,
+  including any remaining final `Retry-After` deadline. Terminal responses acknowledge the WAL;
+  if replay of previously persisted batches fails during shutdown, accepted in-memory events are
+  appended to the WAL in FIFO order instead of disappearing with the process.
 - Config validation for `request_timeout`, `retry_backoff_base`, and `session_timeout` at
   construction time (positive, finite numbers; `request_timeout=None` is rejected — it would
   hand `urlopen` no timeout at all). Previously a negative `retry_backoff_base` raised inside
@@ -13,23 +21,10 @@ here before a version tag is created.
 - `AlitycsConfig.__repr__` masks `api_key` (`…last4`) so configs and exceptions can be logged
   without leaking credentials.
 - `Alitycs.is_shutdown` property: true once `shutdown()` has run.
-
-### Changed
-- The module-level API (`track`, `flush`, `identify`, …) now raises `RuntimeError` after the
-  default instance was shut down instead of silently doing nothing while `flush()` returned
-  `True`. Calls before any `init()` remain no-ops. `get_default_instance()` keeps returning the
-  shut-down instance (check `.is_shutdown`) rather than being nulled.
-- Live instances are held by strong references in `_LIVE_INSTANCES` until `shutdown()` removes
-  them. The daemon flusher thread kept only the batch manager alive, so the garbage collector
-  could previously collect an instance mid-flight, escaping both `shutdown()` and the atexit
-  safety net.
-- Context timezone is reported as an IANA identifier ("America/New_York"), resolved from `TZ`
-  or the `/etc/localtime` target, falling back to the abbreviation where neither resolves.
-
-### Added
-- A 429 response's `Retry-After` header (delta-seconds or HTTP-date) is now honoured: the retry
-  after it waits at least that long instead of the default backoff, still capped at ten seconds.
-  Previously the header was ignored and rate-limited clients hammered through the rate limit.
+- A retryable response's `Retry-After` header (delta-seconds or HTTP-date) is now honoured and
+  retained across durable restart: the next attempt waits that long instead of using the default
+  backoff. SDK-generated exponential backoff is capped at ten seconds and server-provided delays
+  at one hour.
 - Client-side enforcement of the canonical ingestion limits (identical to the server's
   `EventValidator`): ≤50 properties per event, property keys ≤100 chars, values ≤1000 chars,
   estimated event size ≤64KB, non-blank action plus `userId`/`anonymousId` required, epoch-millis
@@ -48,6 +43,17 @@ here before a version tag is created.
 - `README.md` restored: `pyproject.toml` referenced it, so source builds failed without it.
 
 ### Changed
+
+- The module-level API (`track`, `flush`, `identify`, …) now raises `RuntimeError` after the
+  default instance was shut down instead of silently doing nothing while `flush()` returned
+  `True`. Calls before any `init()` remain no-ops. `get_default_instance()` keeps returning the
+  shut-down instance (check `.is_shutdown`) rather than being nulled.
+- Live instances are held by strong references in `_LIVE_INSTANCES` until `shutdown()` removes
+  them. The daemon flusher thread kept only the batch manager alive, so the garbage collector
+  could previously collect an instance mid-flight, escaping both `shutdown()` and the atexit
+  safety net.
+- Context timezone is reported as an IANA identifier ("America/New_York"), resolved from `TZ`
+  or the `/etc/localtime` target, falling back to the abbreviation where neither resolves.
 - `BatchManager.flush()` sends `flush_size`-sized chunks instead of draining the entire queue into
   one payload, matching the size-triggered path.
 - Batch sends report honest outcomes (`SendSuccess` / `SendRejected` / `SendFailed`) instead of
@@ -56,3 +62,21 @@ here before a version tag is created.
   being dropped, and `False` is returned so callers can retry.
 - Transport failures and server rejections are logged at warn level even when `debug` is off;
   delivery problems were previously invisible by default.
+- Fork repair now drops the child's copy of the parent-owned queue and disables the inherited WAL,
+  preventing duplicate delivery and cross-process snapshot corruption. Child processes that need
+  durability must create a fresh client with a child-specific `persistence_path`.
+- WAL growth is capped by `max_queue_size`; mutations roll back their in-memory state on
+  persistence errors and best-effort fsync the parent directory after replace/remove. Terminal
+  durable rejections no longer block later replay. Persistence paths reject overlapping live
+  owners in-process and, on POSIX systems, across processes with an advisory lock.
+- Retry parsing accepts RFC delay-seconds integers rather than arbitrary floats, event-size checks
+  count UTF-8 bytes, rejection splitting is capped at 64 sends, and unreachable configurations
+  where `flush_size > max_queue_size` fail during construction.
+- Finite shutdown deadlines no longer expand into unbounded retry, `Retry-After`, or in-flight
+  waits. Queued durable work is persisted for restart when the deadline expires.
+- Non-batching clients now preserve the shutdown admission boundary without holding the lifecycle
+  lock during network retries; post-shutdown inline events cannot be sent, while unrelated
+  lifecycle readers stay responsive.
+
+[Unreleased]: https://github.com/alitycs/alitycs-sdk-python/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/alitycs/alitycs-sdk-python/releases/tag/v1.0.0

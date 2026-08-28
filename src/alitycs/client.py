@@ -6,7 +6,8 @@ import atexit
 import os
 import signal
 import threading
-from typing import Any, Dict, Mapping, Optional
+import time
+from typing import Any, Dict, Mapping, Optional, Set
 
 from .batch import BatchManager
 from .config import DEFAULT_ENDPOINT, AlitycsConfig
@@ -16,6 +17,7 @@ from .transport import HttpTransport, SendFailed, SendRejected
 from .types import AnalyticsEvent, BatchPayload, EventType, RevenuePayload
 from .utils import (
     EventRejectedError,
+    debug_warn,
     generate_id,
     now_ms,
     serialize_properties,
@@ -33,7 +35,8 @@ class Alitycs:
 
     Events are queued and dispatched in batches on a daemon flusher thread, so
     ``track`` never blocks on network I/O. Call :meth:`flush` to pin a delivery point,
-    or :meth:`shutdown` before process exit — it drains fully and loses nothing.
+    or :meth:`shutdown` before process exit. A finite shutdown deadline persists queued
+    work when durability is enabled; pass ``join_timeout=None`` for an unbounded drain.
     """
 
     def __init__(
@@ -50,6 +53,7 @@ class Alitycs:
         batching: bool = True,
         request_timeout: float = 10.0,
         retry_backoff_base: float = 1.0,
+        persistence_path: Optional[str] = None,
     ) -> None:
         self._config = AlitycsConfig(
             api_key=api_key,
@@ -63,6 +67,7 @@ class Alitycs:
             batching=batching,
             request_timeout=request_timeout,
             retry_backoff_base=retry_backoff_base,
+            persistence_path=persistence_path,
         )
         self._transport = HttpTransport(
             endpoint=self._config.endpoint,
@@ -71,6 +76,8 @@ class Alitycs:
             request_timeout=self._config.request_timeout,
             retry_backoff_base=self._config.retry_backoff_base,
             debug=self._config.debug,
+            persistence_path=self._config.persistence_path,
+            max_pending_events=self._config.max_queue_size,
         )
         self._session_manager = SessionManager(self._config.session_timeout)
         self._batch_manager: Optional[BatchManager] = (
@@ -80,12 +87,23 @@ class Alitycs:
                 max_queue_size=self._config.max_queue_size,
                 send_fn=self._transport.send,
                 debug=self._config.debug,
+                recover_fn=self._transport.recover,
+                durable_pending_fn=lambda: self._transport.durable_pending_events,
+                durable=self._transport.durable_enabled,
+                persist_fn=self._transport.persist,
+                send_with_deadline_fn=self._transport.send,
+                durable_pending_snapshot_fn=self._transport.durable_pending_snapshot,
             )
             if self._config.batching
             else None
         )
         # Guards identity and global property mutations across threads.
         self._identity_lock = threading.RLock()
+        self._lifecycle_lock = threading.RLock()
+        self._inline_idle = threading.Condition(self._lifecycle_lock)
+        self._inline_inflight = 0
+        self._inline_batch_ids: Set[str] = set()
+        self._closed = False
         self._user_id: Optional[str] = None
         self._global_properties: Dict[str, Any] = {}
         self._rejected_locally_count = 0
@@ -98,13 +116,20 @@ class Alitycs:
     @property
     def is_shutdown(self) -> bool:
         """True once :meth:`shutdown` has run; a shut-down client accepts no events."""
-        return self._batch_manager is not None and self._batch_manager.closed
+        with self._lifecycle_lock:
+            return self._closed
 
     @property
     def pending(self) -> int:
         """Events not yet delivered: queued plus in an in-flight send."""
         if self._batch_manager is None:
-            return 0
+            with self._inline_idle:
+                inline_inflight = self._inline_inflight
+                active_batch_ids = list(self._inline_batch_ids)
+            durable_pending, overlap = self._transport.durable_pending_snapshot(
+                active_batch_ids
+            )
+            return inline_inflight + durable_pending - min(overlap, inline_inflight)
         return self._batch_manager.pending
 
     @property
@@ -207,14 +232,29 @@ class Alitycs:
         when every event was delivered; ``False`` when a send failed (survivors stay
         queued for a later flush) or a ``timeout`` was given and elapsed first."""
         if self._batch_manager is None:
-            return True
+            deadline = None if timeout is None else time.monotonic() + timeout
+            return self._transport.recover(deadline)
         return self._batch_manager.flush(timeout)
 
     def shutdown(self, join_timeout: Optional[float] = _DEFAULT_SHUTDOWN_JOIN_TIMEOUT) -> None:
-        """Stop accepting events and drain fully. Safe to call from ``atexit``
-        handlers and more than once."""
+        """Stop accepting events and drain within ``join_timeout``. Safe to call from
+        ``atexit`` handlers and more than once. Pass ``None`` to wait without a limit."""
+        deadline = None if join_timeout is None else time.monotonic() + max(0.0, join_timeout)
+        with self._inline_idle:
+            self._closed = True
+            while self._inline_inflight:
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                if remaining == 0.0:
+                    break
+                self._inline_idle.wait(remaining)
         if self._batch_manager is not None:
-            self._batch_manager.shutdown(join_timeout)
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            self._batch_manager.shutdown(remaining)
+        elif deadline is None:
+            # Finite shutdown never starts another potentially long recovery after the
+            # admitted inline sends finish. Failed durable sends remain in the WAL for
+            # the next explicit flush or process restart.
+            self._transport.recover()
         _LIVE_INSTANCES.discard(self)
 
     def _enqueue(
@@ -257,26 +297,51 @@ class Alitycs:
             return
 
         if self._batch_manager is not None:
-            self._batch_manager.add(event)
+            with self._lifecycle_lock:
+                if self._closed:
+                    if self._config.debug:
+                        debug_warn("Client shut down — dropping event")
+                    return
+                self._batch_manager.add(event)
         else:
             # Batching disabled: deliver inline; failures are reported, not hidden.
+            # Admission is guarded, but network I/O happens outside the lifecycle lock
+            # so readers and shutdown are never serialized behind retries or backoff.
             payload = BatchPayload(
                 batch_id=f"batch_{generate_id()}",
                 sent_at=now_ms(),
                 events=[event],
             )
-            outcome = self._transport.send(payload)
+            with self._inline_idle:
+                if self._closed:
+                    if self._config.debug:
+                        debug_warn("Client shut down — dropping event")
+                    return
+                self._inline_inflight += 1
+                self._inline_batch_ids.add(payload.batch_id)
+            try:
+                outcome = self._transport.send(payload)
+            finally:
+                with self._inline_idle:
+                    self._inline_batch_ids.discard(payload.batch_id)
+                    self._inline_inflight -= 1
+                    self._inline_idle.notify_all()
             if isinstance(outcome, SendRejected):
                 warn(f"Server rejected event {event.event_id} with HTTP {outcome.status}")
             elif isinstance(outcome, SendFailed):
                 warn(f"Transport failure ({outcome.reason}) — event {event.event_id} not delivered")
 
     def _reset_for_child(self) -> None:
-        """Post-fork repair in the child process: drop inherited locks and forget the
-        parent's flusher thread so a fresh one starts lazily."""
-        self._batch_manager.reset_for_child()
+        """Post-fork repair without replaying the parent's queued or durable work."""
+        if self._batch_manager is not None:
+            self._batch_manager.reset_for_child()
+        self._transport.reset_for_child()
         self._session_manager.reset_for_child()
         self._identity_lock = threading.RLock()
+        self._lifecycle_lock = threading.RLock()
+        self._inline_idle = threading.Condition(self._lifecycle_lock)
+        self._inline_inflight = 0
+        self._inline_batch_ids = set()
 
 
 # Module-level convenience API over a default instance ----------------------------
@@ -368,9 +433,9 @@ def flush(timeout: Optional[float] = None) -> bool:
 
 
 def shutdown(**kwargs: Any) -> None:
-    """Shut down the default instance (drains fully). Safe to call more than once and
-    before :func:`init`; afterwards the module-level API raises until a new default
-    is created with :func:`init`."""
+    """Shut down the default instance within its configured deadline. Safe to call more
+    than once and before :func:`init`; afterwards the module-level API raises until a
+    new default is created with :func:`init`."""
     if _default_instance is not None:
         _default_instance.shutdown(**kwargs)
 

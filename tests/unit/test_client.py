@@ -119,6 +119,27 @@ class TestInstanceBasics:
         assert client.pending == 0
         client.shutdown(join_timeout=2.0)
 
+    def test_batched_flush_timeout_does_not_sleep_full_retry_after(
+        self, capture_factory, tmp_path
+    ):
+        server = capture_factory(responder=lambda request: (429, {"Retry-After": "300"}))
+        client = Alitycs(
+            api_key="pk_bounded_flush",
+            endpoint=server.url,
+            flush_size=100,
+            flush_interval=None,
+            max_retries=1,
+            persistence_path=str(tmp_path / "bounded-flush-wal.json"),
+        )
+        client.track("bounded_flush")
+
+        started_at = time.monotonic()
+        assert client.flush(timeout=0.5) is False
+        assert time.monotonic() - started_at < 1.5
+        assert len(server.requests) == 1
+        assert client.pending == 1
+        client.shutdown(join_timeout=0.0)
+
     def test_inline_send_swallows_failures(self, capture_factory):
         server = capture_factory(responder=lambda request: 500)
         client = Alitycs(
@@ -133,20 +154,125 @@ class TestInstanceBasics:
         client.track("inline_doomed")  # must not raise despite the 500
         client.shutdown(join_timeout=2.0)
 
-    def test_queue_full_drops_events_without_raising(self, capture_server):
+    def test_inline_send_does_not_block_lifecycle_readers_or_shutdown_deadline(self, capture_server):
+        from alitycs.transport import SendSuccess
+
+        started = threading.Event()
+        release = threading.Event()
+        sent_names = []
         client = Alitycs(
-            api_key="pk_unit",
+            api_key="pk_inline_concurrency",
             endpoint=capture_server.url,
-            flush_size=100,
-            flush_interval=None,
-            max_queue_size=2,
+            batching=False,
+            max_retries=0,
         )
-        client.track("q1")
-        client.track("q2")
-        client.track("q3")  # over the cap: dropped loudly
-        assert client.flush()
-        assert sorted(capture_server.event_names) == ["q1", "q2"]
+
+        def blocked_send(payload):
+            sent_names.extend(event.event for event in payload.events)
+            started.set()
+            release.wait(5)
+            return SendSuccess()
+
+        client._transport.send = blocked_send
+        sender = threading.Thread(target=lambda: client.track("blocked_inline"))
+        sender.start()
+        assert started.wait(2)
+        assert client.pending == 1
+
+        observed = []
+        reader_done = threading.Event()
+
+        def read_lifecycle() -> None:
+            observed.append(client.is_shutdown)
+            reader_done.set()
+
+        reader = threading.Thread(target=read_lifecycle)
+        reader.start()
+        assert reader_done.wait(0.5)
+        assert observed == [False]
+
+        shutdown_done = threading.Event()
+
+        def bounded_shutdown() -> None:
+            client.shutdown(join_timeout=0.05)
+            shutdown_done.set()
+
+        shutdown_thread = threading.Thread(target=bounded_shutdown)
+        shutdown_thread.start()
+        assert shutdown_done.wait(0.5)
+        assert client.is_shutdown is True
+        client.track("after_shutdown")
+        assert sent_names == ["blocked_inline"]
+
+        release.set()
+        sender.join(timeout=2)
+        reader.join(timeout=2)
+        shutdown_thread.join(timeout=2)
+        assert not sender.is_alive()
+        assert client.pending == 0
+
+    def test_durable_inline_pending_counts_persisted_active_send_once(
+        self, capture_server, tmp_path
+    ):
+        started = threading.Event()
+        release = threading.Event()
+        client = Alitycs(
+            api_key="pk_inline_pending",
+            endpoint=capture_server.url,
+            batching=False,
+            max_retries=0,
+            persistence_path=str(tmp_path / "inline-pending-wal.json"),
+        )
+
+        def blocked_post(body, request_timeout=None):  # noqa: ARG001 - transport fake
+            started.set()
+            release.wait(5)
+            return 202, None
+
+        client._transport._post = blocked_post
+        sender = threading.Thread(target=lambda: client.track("durable_inline"))
+        sender.start()
+        assert started.wait(2)
+
+        assert client.pending == 1
+
+        release.set()
+        sender.join(timeout=2)
+        assert not sender.is_alive()
+        assert client.pending == 0
         client.shutdown(join_timeout=2.0)
+
+    def test_unbounded_repeat_shutdown_recovers_inline_wal_after_finite_shutdown(
+        self, capture_factory, tmp_path
+    ):
+        state = {"status": 500}
+        server = capture_factory(responder=lambda request: state["status"])
+        client = Alitycs(
+            api_key="pk_inline_recovery",
+            endpoint=server.url,
+            batching=False,
+            max_retries=0,
+            persistence_path=str(tmp_path / "inline-wal.json"),
+        )
+
+        client.track("retained_inline")
+        assert client.pending == 1
+        client.shutdown(join_timeout=0.01)
+        assert client.pending == 1
+
+        state["status"] = 200
+        client.shutdown(join_timeout=None)
+        assert client.pending == 0
+
+    def test_unreachable_flush_threshold_is_rejected(self, capture_server):
+        with pytest.raises(ValueError, match="flush_size"):
+            Alitycs(
+                api_key="pk_unit",
+                endpoint=capture_server.url,
+                flush_size=100,
+                flush_interval=None,
+                max_queue_size=2,
+            )
 
     def test_oversized_property_is_rejected_locally_and_never_queued(self, capture_server, capsys):
         client = self._client_with(capture_server)
@@ -286,6 +412,18 @@ class TestModuleLevelApi:
         assert client.is_shutdown is False
         client.shutdown(join_timeout=2.0)
         assert client.is_shutdown is True
+
+    def test_non_batching_client_stays_closed_after_shutdown(self, capture_server):
+        client = Alitycs(
+            api_key="pk_inline_closed",
+            endpoint=capture_server.url,
+            batching=False,
+            max_retries=0,
+        )
+        client.shutdown(join_timeout=2.0)
+        assert client.is_shutdown is True
+        client.track("must_not_send")
+        assert capture_server.requests == []
 
 
 class TestProcessHooks:
