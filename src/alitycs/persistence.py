@@ -137,13 +137,18 @@ class FileBatchStore:
                 raise
 
     def pause(self, batch_id: str, paused_until: Optional[float]) -> None:
-        if paused_until is not None and (
-            not isinstance(paused_until, (int, float))
-            or isinstance(paused_until, bool)
-            or not math.isfinite(float(paused_until))
-        ):
-            raise ValueError("Alitycs persistence pause must be a finite number or None")
-        normalized_pause = None if paused_until is None else float(paused_until)
+        normalized_pause: Optional[float] = None
+        if paused_until is not None:
+            if not isinstance(paused_until, (int, float)) or isinstance(paused_until, bool):
+                raise ValueError("Alitycs persistence pause must be a finite number or None")
+            try:
+                normalized_pause = float(paused_until)
+            except (OverflowError, ValueError) as exc:
+                raise ValueError(
+                    "Alitycs persistence pause must be a finite number or None"
+                ) from exc
+            if not math.isfinite(normalized_pause):
+                raise ValueError("Alitycs persistence pause must be a finite number or None")
         with self._lock:
             if self._path is None:
                 return

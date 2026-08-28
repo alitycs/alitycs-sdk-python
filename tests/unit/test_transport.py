@@ -380,7 +380,11 @@ def test_store_rolls_back_memory_when_persist_fails(monkeypatch, tmp_path):
     assert store.pending_events == 0
 
 
-@pytest.mark.parametrize("paused_until", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize(
+    "paused_until",
+    [float("nan"), float("inf"), float("-inf"), 10**10000],
+    ids=["nan", "positive-infinity", "negative-infinity", "oversized-integer"],
+)
 def test_store_rejects_non_finite_pause_without_mutating_wal(tmp_path, paused_until):
     state_file = tmp_path / "alitycs-wal.json"
     store = FileBatchStore(str(state_file))
