@@ -33,8 +33,11 @@ from .utils import debug_warn, generate_id, now_ms, warn
 
 #: Legacy fakes may return ``None``; that is treated as success.
 SendFn = Callable[[BatchPayload], Optional[Union[SendSuccess, SendRejected, SendFailed]]]
+DeadlineSendFn = Callable[
+    [BatchPayload, Optional[float]], Optional[Union[SendSuccess, SendRejected, SendFailed]]
+]
 Clock = Callable[[], float]
-RecoverFn = Callable[[], bool]
+RecoverFn = Callable[[Optional[float]], bool]
 DurablePendingFn = Callable[[], int]
 PersistFn = Callable[[BatchPayload], bool]
 
@@ -65,6 +68,7 @@ class BatchManager:
         durable_pending_fn: Optional[DurablePendingFn] = None,
         durable: bool = False,
         persist_fn: Optional[PersistFn] = None,
+        send_with_deadline_fn: Optional[DeadlineSendFn] = None,
     ) -> None:
         self._flush_size = flush_size
         self._flush_interval = flush_interval
@@ -76,12 +80,14 @@ class BatchManager:
         self._durable_pending_fn = durable_pending_fn
         self._durable = durable
         self._persist_fn = persist_fn
+        self._send_with_deadline_fn = send_with_deadline_fn
 
         self._cv = threading.Condition()
         self._queue: "deque[AnalyticsEvent]" = deque()
         self._inflight = 0
         self._stopping = False
         self._closed = False
+        self._finite_shutdown_complete = False
         self._thread: Optional[threading.Thread] = None
         self._next_tick = self._clock() + flush_interval if flush_interval else None
 
@@ -144,10 +150,14 @@ class BatchManager:
         ``False`` when a send failed (survivors stay queued), or ``timeout`` elapsed.
         Safe to call concurrently — callers share in-flight sends instead of
         duplicating them."""
-        if not self._recover_durable():
+        deadline = None if timeout is None else self._clock() + timeout
+        with self._cv:
+            # A caller has explicitly resumed draining after a previous finite shutdown.
+            # Late failures must become pending work for this caller, not terminal loss.
+            self._finite_shutdown_complete = False
+        if not self._recover_durable(deadline):
             return False
         self._ensure_worker()
-        deadline = None if timeout is None else self._clock() + timeout
         all_delivered = True
         while True:
             batch: List[AnalyticsEvent] = []
@@ -174,7 +184,7 @@ class BatchManager:
                     cv.wait(None if deadline is None else max(0.0, deadline - now))
             if not batch:
                 continue
-            outcome = self._send_batch(batch)
+            outcome = self._send_batch(batch, deadline)
             if outcome == _OK:
                 continue
             all_delivered = False
@@ -196,6 +206,8 @@ class BatchManager:
         """
         deadline = None if join_timeout is None else self._clock() + max(0.0, join_timeout)
         with self._cv:
+            if deadline is None:
+                self._finite_shutdown_complete = False
             self._stopping = True
             self._closed = True
             self._cv.notify_all()
@@ -209,6 +221,8 @@ class BatchManager:
             # that path inline because HTTP retries and Retry-After sleeps can outlive
             # the caller's deadline. Any queued remainder is safe on disk when durable;
             # an in-flight durable batch was persisted by the transport before sending.
+            with self._cv:
+                self._finite_shutdown_complete = True
             self._persist_queued_for_shutdown()
             return
 
@@ -316,15 +330,17 @@ class BatchManager:
                     return False
                 self._cv.wait(None if deadline is None else max(0.0, deadline - now))
 
-    def _send_batch(self, batch: List[AnalyticsEvent]) -> str:
+    def _send_batch(
+        self, batch: List[AnalyticsEvent], deadline: Optional[float] = None
+    ) -> str:
         """Dispatch one batch. Returns ``_OK``, ``_REJECTED``, or ``_TRANSIENT``
         (with survivors re-queued at the head). Never raises."""
         try:
-            if not self._recover_durable():
+            if not self._recover_durable(deadline):
                 self._requeue_at_head(batch)
                 result = _TRANSIENT
             else:
-                result = self._deliver(list(batch), [_MAX_SPLIT_SENDS])
+                result = self._deliver(list(batch), [_MAX_SPLIT_SENDS], deadline)
         except Exception as exc:  # noqa: BLE001 - delivery must never crash the host
             warn(f"Batch dispatch failed ({type(exc).__name__}: {exc})")
             self._requeue_at_head(batch)
@@ -335,11 +351,11 @@ class BatchManager:
                 self._cv.notify_all()
         return result
 
-    def _recover_durable(self) -> bool:
+    def _recover_durable(self, deadline: Optional[float] = None) -> bool:
         if self._recover_fn is None:
             return True
         try:
-            return self._recover_fn()
+            return self._recover_fn(deadline)
         except Exception as exc:  # noqa: BLE001 - persistence/network failures are reported
             warn(f"Durable batch recovery failed ({type(exc).__name__}: {exc})")
             return False
@@ -378,7 +394,12 @@ class BatchManager:
             warn(f"Shutdown persistence failed — {lost} queued event(s) lost")
             return
 
-    def _deliver(self, events: List[AnalyticsEvent], remaining_sends: List[int]) -> str:
+    def _deliver(
+        self,
+        events: List[AnalyticsEvent],
+        remaining_sends: List[int],
+        deadline: Optional[float] = None,
+    ) -> str:
         if remaining_sends[0] <= 0:
             with self._cv:
                 self._lost_count += len(events)
@@ -393,7 +414,11 @@ class BatchManager:
             events=list(events),
         )
         try:
-            outcome = self._send_fn(payload)
+            outcome = (
+                self._send_fn(payload)
+                if self._send_with_deadline_fn is None
+                else self._send_with_deadline_fn(payload, deadline)
+            )
         except Exception as exc:  # noqa: BLE001 - legacy send fns raise instead of outcomes
             warn(f"Batch send failed ({type(exc).__name__}: {exc})")
             outcome = SendFailed(f"{type(exc).__name__}: {exc}")
@@ -404,8 +429,8 @@ class BatchManager:
                 # half and retry each side so valid events still land; depth is bounded
                 # by log2(len(events)).
                 mid = len(events) // 2
-                left = self._deliver(events[:mid], remaining_sends)
-                right = self._deliver(events[mid:], remaining_sends)
+                left = self._deliver(events[:mid], remaining_sends, deadline)
+                right = self._deliver(events[mid:], remaining_sends, deadline)
                 if _TRANSIENT in (left, right):
                     return _TRANSIENT
                 return _OK if _REJECTED not in (left, right) else _REJECTED
@@ -433,9 +458,19 @@ class BatchManager:
         return _OK
 
     def _requeue_at_head(self, events: List[AnalyticsEvent]) -> None:
+        abandoned = False
         with self._cv:
-            self._requeued_count += len(events)
-            # extendleft reverses its argument, so pass the reversed list to keep the
-            # original order at the head of the queue.
-            self._queue.extendleft(reversed(events))
+            if self._finite_shutdown_complete:
+                self._lost_count += len(events)
+                abandoned = True
+            else:
+                self._requeued_count += len(events)
+                # extendleft reverses its argument, so pass the reversed list to keep the
+                # original order at the head of the queue.
+                self._queue.extendleft(reversed(events))
             self._cv.notify_all()
+        if abandoned:
+            warn(
+                f"Transport failed after the shutdown deadline — {len(events)} "
+                "in-flight event(s) lost"
+            )

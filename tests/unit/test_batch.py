@@ -207,6 +207,75 @@ def test_shutdown_deadline_persists_queued_remainder_while_send_is_blocked():
     manager.shutdown(join_timeout=None)
 
 
+def test_non_durable_failure_after_shutdown_deadline_is_counted_as_lost():
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked_failure(payload: BatchPayload):
+        started.set()
+        release.wait(5)
+        return SendFailed("still down")
+
+    manager = BatchManager(
+        flush_size=1,
+        flush_interval=None,
+        max_queue_size=10,
+        send_fn=blocked_failure,
+    )
+    manager.add(make_event("in-flight"))
+    assert started.wait(2)
+
+    manager.shutdown(join_timeout=0.05)
+    release.set()
+    deadline = time.monotonic() + 2
+    while manager._worker_alive() and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+    assert not manager._worker_alive()
+    assert manager.pending == 0
+    assert manager.requeued_total == 0
+    assert manager.lost_total == 1
+
+
+def test_unbounded_repeat_shutdown_can_resume_a_timed_out_inflight_send():
+    started = threading.Event()
+    release = threading.Event()
+    attempts = {"count": 0}
+
+    def blocked_then_good(payload: BatchPayload):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            started.set()
+            release.wait(5)
+            return SendFailed("still down")
+        return None
+
+    manager = BatchManager(
+        flush_size=1,
+        flush_interval=None,
+        max_queue_size=10,
+        send_fn=blocked_then_good,
+    )
+    manager.add(make_event("retry-me"))
+    assert started.wait(2)
+    manager.shutdown(join_timeout=0.05)
+
+    finished = threading.Event()
+    drainer = threading.Thread(
+        target=lambda: (manager.shutdown(join_timeout=None), finished.set())
+    )
+    drainer.start()
+    time.sleep(0.05)
+    release.set()
+
+    assert finished.wait(2)
+    drainer.join(timeout=2)
+    assert attempts["count"] == 2
+    assert manager.delivered_total == 1
+    assert manager.requeued_total == 1
+    assert manager.lost_total == 0
+
+
 def test_flush_after_shutdown_still_drains_stragglers_inline():
     sent = SentBatches()
     manager = make_manager(sent, flush_size=100)
@@ -453,7 +522,7 @@ def test_flush_reports_durable_background_failure_as_undelivered():
         flush_interval=None,
         max_queue_size=10,
         send_fn=lambda payload: SendFailed("response lost", durable=True),
-        recover_fn=lambda: True,
+        recover_fn=lambda deadline: True,
         durable_pending_fn=lambda: 1,
         durable=True,
     )
@@ -479,7 +548,7 @@ def test_shutdown_persists_queued_events_fifo_when_recovery_is_blocked():
         flush_interval=None,
         max_queue_size=10,
         send_fn=lambda payload: None,
-        recover_fn=lambda: False,
+        recover_fn=lambda deadline: False,
         durable_pending_fn=lambda: durable_pending[0],
         durable=True,
         persist_fn=persist,
@@ -514,7 +583,7 @@ def test_shutdown_counts_only_unpersisted_suffix_as_lost():
         flush_interval=None,
         max_queue_size=10,
         send_fn=lambda payload: None,
-        recover_fn=lambda: False,
+        recover_fn=lambda deadline: False,
         durable_pending_fn=lambda: durable_pending[0],
         durable=True,
         persist_fn=persist,

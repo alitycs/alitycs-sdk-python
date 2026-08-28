@@ -35,9 +35,10 @@ client.capture_error("checkout_failed", {"code": "E_CARD"}, user_id=request.user
 The same `user_id` keyword is accepted by `track_revenue()` and `page()` and
 does not change the identity used by any other call.
 
-Events are queued and dispatched in batches on a daemon flusher thread, so `track`
-never blocks on network I/O. Batches flush when `flush_size` (default 20) events are
-queued, every `flush_interval` seconds (default 2.0), or when you call `flush()` /
+With batching enabled (the default), events are queued and dispatched on a daemon flusher thread,
+so `track` does not block on network I/O. With `batching=False`, each `track` call sends inline and
+can block up to the configured request/retry limits. Batches flush when `flush_size` (default 20)
+events are queued, every `flush_interval` seconds (default 2.0), or when you call `flush()` /
 `shutdown()` explicitly. `shutdown()` waits up to 30 seconds by default; pass
 `join_timeout=None` only when an unbounded drain is appropriate. On process exit a safety net
 drains live instances; SIGTERM and SIGINT also trigger a best-effort drain before the default
@@ -76,12 +77,13 @@ Alitycs(
   Authentication, authorization, redirect, and other permanent responses are never split.
 - Retries reuse the exact batch body so `batchId` stays stable for server-side dedup.
 - SDK-generated exponential backoff is capped at 10 seconds. A server `Retry-After`
-  replaces that generated delay and is not shortened to the client cap.
+  replaces that generated delay and is capped at one hour to keep delivery bounded.
 - A new process using the same `persistence_path` replays retained bodies on
   `flush()` (or an unbounded shutdown) and honors any remaining persisted `Retry-After` deadline.
   If a finite shutdown deadline expires first, queued events are appended to the WAL in FIFO order.
   The WAL starts immediately before the first network attempt and is capped at `max_queue_size`
-  retained events. Use one client process per path. After a fork, the child drops its
+  retained events. Each path is exclusively owned by one live client; a same-process registry and
+  a POSIX advisory lock reject overlapping owners. After a fork, the child drops its
   copy of the parent-owned queue and detaches from the inherited WAL; create a fresh client with a
   child-specific path when child delivery also needs durability.
 

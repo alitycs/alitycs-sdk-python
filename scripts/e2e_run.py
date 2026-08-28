@@ -30,8 +30,14 @@ def main() -> int:
     run_id = os.environ["ALITYCS_RUN_ID"]
     phase = (os.environ.get("ALITYCS_E2E_PHASE") or "").strip()
     state_file = (os.environ.get("ALITYCS_STATE_FILE") or "").strip() or None
+    if phase in ("first", "restart") and state_file is None:
+        print("ALITYCS_STATE_FILE is required for persistence phases", file=sys.stderr)
+        return 1
     if phase == "first":
-        endpoint = os.environ["ALITYCS_FAILURE_ENDPOINT"]
+        endpoint = (os.environ.get("ALITYCS_FAILURE_ENDPOINT") or "").strip()
+        if not endpoint:
+            print("ALITYCS_FAILURE_ENDPOINT is required for the first phase", file=sys.stderr)
+            return 1
 
     sdk = alitycs.init(
         api_key,
@@ -52,6 +58,7 @@ def main() -> int:
         sdk.track(f"sdk_python_restart_{run_id}")
         if sdk.flush():
             print("first phase unexpectedly delivered the event", file=sys.stderr)
+            sys.stderr.flush()
             os._exit(1)
         os._exit(0)
     if phase == "restart":

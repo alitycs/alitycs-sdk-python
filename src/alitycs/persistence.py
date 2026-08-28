@@ -8,7 +8,16 @@ import os
 import tempfile
 import threading
 from pathlib import Path
-from typing import Dict, List, Optional, TypedDict
+from typing import Dict, List, Optional, Set, TypedDict
+
+try:  # POSIX advisory locking; the in-process registry remains the portable floor.
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on Windows
+    fcntl = None  # type: ignore[assignment]
+
+
+_OWNED_PATHS: Set[str] = set()
+_OWNED_PATHS_LOCK = threading.Lock()
 
 
 class DurableBatchRecord(TypedDict):
@@ -19,15 +28,26 @@ class DurableBatchRecord(TypedDict):
 
 
 class FileBatchStore:
-    """A single-process write-ahead log replaced atomically after every mutation."""
+    """An exclusively owned write-ahead log replaced atomically after every mutation."""
 
     def __init__(self, path: Optional[str], max_pending_events: int = 1000) -> None:
         if max_pending_events < 1:
             raise ValueError("Alitycs persistence max_pending_events must be positive")
-        self._path = Path(path) if path is not None else None
+        self._path = Path(path).expanduser().resolve() if path is not None else None
         self._max_pending_events = max_pending_events
         self._lock = threading.RLock()
         self._records: Dict[str, DurableBatchRecord] = {}
+        self._ownership_key: Optional[str] = None
+        self._lock_descriptor: Optional[int] = None
+        if self._path is not None:
+            self._acquire_ownership()
+        try:
+            self._load()
+        except Exception:
+            self.close()
+            raise
+
+    def _load(self) -> None:
         if self._path is not None and self._path.is_file():
             try:
                 state = json.loads(self._path.read_text(encoding="utf-8"))
@@ -142,8 +162,24 @@ class FileBatchStore:
         inherited = self._path is not None
         self._lock = threading.RLock()
         self._records = {}
+        # The descriptor is inherited from the parent's open-file description. Closing
+        # the child's copy is safe; an explicit LOCK_UN here could release the parent's
+        # advisory lock as well.
+        self._release_ownership(unlock=False)
         self._path = None
         return inherited
+
+    def close(self) -> None:
+        """Release this process's ownership without deleting retained batches."""
+        self._release_ownership()
+        self._path = None
+        self._records = {}
+
+    def __del__(self) -> None:  # pragma: no cover - deterministic callers use close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def snapshot(self) -> List[DurableBatchRecord]:
         with self._lock:
@@ -193,6 +229,48 @@ class FileBatchStore:
 
     def _copy_records(self) -> Dict[str, DurableBatchRecord]:
         return {batch_id: record.copy() for batch_id, record in self._records.items()}  # type: ignore[misc]
+
+    def _acquire_ownership(self) -> None:
+        assert self._path is not None
+        key = str(self._path)
+        with _OWNED_PATHS_LOCK:
+            if key in _OWNED_PATHS:
+                raise ValueError(f"Alitycs persistence path already in use: {key}")
+            _OWNED_PATHS.add(key)
+        self._ownership_key = key
+
+        if fcntl is None:
+            return
+        descriptor: Optional[int] = None
+        try:
+            self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+            descriptor = os.open(f"{key}.lock", flags, 0o600)
+            os.chmod(f"{key}.lock", 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._lock_descriptor = descriptor
+        except (OSError, ValueError) as exc:
+            if descriptor is not None:
+                os.close(descriptor)
+            with _OWNED_PATHS_LOCK:
+                _OWNED_PATHS.discard(key)
+            self._ownership_key = None
+            raise ValueError(f"Alitycs persistence path already in use or unavailable: {key}") from exc
+
+    def _release_ownership(self, *, unlock: bool = True) -> None:
+        descriptor = self._lock_descriptor
+        self._lock_descriptor = None
+        if descriptor is not None:
+            try:
+                if unlock and fcntl is not None:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+        key = self._ownership_key
+        self._ownership_key = None
+        if key is not None:
+            with _OWNED_PATHS_LOCK:
+                _OWNED_PATHS.discard(key)
 
     def _sync_parent_best_effort(self) -> None:
         """Persist directory metadata where the platform supports directory fsync."""

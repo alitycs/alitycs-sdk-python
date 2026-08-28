@@ -119,6 +119,27 @@ class TestInstanceBasics:
         assert client.pending == 0
         client.shutdown(join_timeout=2.0)
 
+    def test_batched_flush_timeout_does_not_sleep_full_retry_after(
+        self, capture_factory, tmp_path
+    ):
+        server = capture_factory(responder=lambda request: (429, {"Retry-After": "300"}))
+        client = Alitycs(
+            api_key="pk_bounded_flush",
+            endpoint=server.url,
+            flush_size=100,
+            flush_interval=None,
+            max_retries=1,
+            persistence_path=str(tmp_path / "bounded-flush-wal.json"),
+        )
+        client.track("bounded_flush")
+
+        started_at = time.monotonic()
+        assert client.flush(timeout=0.5) is False
+        assert time.monotonic() - started_at < 1.5
+        assert len(server.requests) == 1
+        assert client.pending == 1
+        client.shutdown(join_timeout=0.0)
+
     def test_inline_send_swallows_failures(self, capture_factory):
         server = capture_factory(responder=lambda request: 500)
         client = Alitycs(

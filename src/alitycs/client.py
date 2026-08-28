@@ -91,6 +91,7 @@ class Alitycs:
                 durable_pending_fn=lambda: self._transport.durable_pending_events,
                 durable=self._transport.durable_enabled,
                 persist_fn=self._transport.persist,
+                send_with_deadline_fn=self._transport.send,
             )
             if self._config.batching
             else None
@@ -223,7 +224,8 @@ class Alitycs:
         when every event was delivered; ``False`` when a send failed (survivors stay
         queued for a later flush) or a ``timeout`` was given and elapsed first."""
         if self._batch_manager is None:
-            return self._transport.recover()
+            deadline = None if timeout is None else time.monotonic() + timeout
+            return self._transport.recover(deadline)
         return self._batch_manager.flush(timeout)
 
     def shutdown(self, join_timeout: Optional[float] = _DEFAULT_SHUTDOWN_JOIN_TIMEOUT) -> None:

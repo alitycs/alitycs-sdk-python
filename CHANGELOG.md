@@ -21,9 +21,10 @@ here before a version tag is created.
 - `AlitycsConfig.__repr__` masks `api_key` (`…last4`) so configs and exceptions can be logged
   without leaking credentials.
 - `Alitycs.is_shutdown` property: true once `shutdown()` has run.
-- A 429 response's `Retry-After` header (delta-seconds or HTTP-date) is now honoured: the retry
-  after it waits at least that long instead of the default backoff. Only SDK-generated exponential
-  backoff is capped at ten seconds; server deadlines are not shortened.
+- A retryable response's `Retry-After` header (delta-seconds or HTTP-date) is now honoured and
+  retained across durable restart: the next attempt waits that long instead of using the default
+  backoff. SDK-generated exponential backoff is capped at ten seconds and server-provided delays
+  at one hour.
 - Client-side enforcement of the canonical ingestion limits (identical to the server's
   `EventValidator`): ≤50 properties per event, property keys ≤100 chars, values ≤1000 chars,
   estimated event size ≤64KB, non-blank action plus `userId`/`anonymousId` required, epoch-millis
@@ -66,7 +67,8 @@ here before a version tag is created.
   durability must create a fresh client with a child-specific `persistence_path`.
 - WAL growth is capped by `max_queue_size`; mutations roll back their in-memory state on
   persistence errors and best-effort fsync the parent directory after replace/remove. Terminal
-  durable rejections no longer block later replay.
+  durable rejections no longer block later replay. Persistence paths reject overlapping live
+  owners in-process and, on POSIX systems, across processes with an advisory lock.
 - Retry parsing accepts RFC delay-seconds integers rather than arbitrary floats, event-size checks
   count UTF-8 bytes, rejection splitting is capped at 64 sends, and unreachable configurations
   where `flush_size > max_queue_size` fail during construction.
