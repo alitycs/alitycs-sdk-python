@@ -114,6 +114,17 @@ class HttpTransport:
             warn(f"Transport persistence failed — delivery unresolved: {reason}")
             return SendFailed(reason, durable=durable)
 
+    def persist(self, payload: BatchPayload) -> bool:
+        """Persist one exact batch without attempting the network."""
+        try:
+            body = json.dumps(payload.to_dict(), separators=(",", ":")).encode("utf-8")
+            with self._delivery_lock:
+                self._store.put(payload.batch_id, body, len(payload.events))
+                return self._store.contains(payload.batch_id)
+        except Exception as exc:  # noqa: BLE001 - shutdown must report storage failure
+            warn(f"Shutdown persistence failed ({type(exc).__name__}: {exc})")
+            return False
+
     def recover(self) -> bool:
         """Replay persisted bodies exactly, honoring any remaining Retry-After pause."""
         with self._delivery_lock:

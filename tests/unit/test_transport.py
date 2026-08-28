@@ -206,6 +206,33 @@ def test_persisted_batch_is_replayed_byte_identically_after_restart(capture_fact
     assert not state_file.exists()
 
 
+def test_persist_stores_without_network_then_recovery_delivers(capture_server, tmp_path):
+    state_file = tmp_path / "alitycs-wal.json"
+    transport = make_transport(capture_server, max_retries=0, persistence_path=str(state_file))
+    payload = make_payload("shutdown")
+
+    assert transport.persist(payload) is True
+    assert transport.durable_pending_events == 1
+    assert capture_server.requests == []
+
+    assert transport.recover() is True
+    assert transport.durable_pending_events == 0
+    assert capture_server.requests[0]["payload"]["batchId"] == payload.batch_id
+
+
+def test_persist_failure_returns_false_without_network(capture_server, tmp_path):
+    parent_file = tmp_path / "parent-file"
+    parent_file.write_text("not a directory", encoding="utf-8")
+    transport = make_transport(
+        capture_server,
+        max_retries=0,
+        persistence_path=str(parent_file / "wal.json"),
+    )
+
+    assert transport.persist(make_payload("failed")) is False
+    assert capture_server.requests == []
+
+
 def test_restart_honours_persisted_retry_after_deadline(capture_factory, tmp_path):
     server = capture_factory(
         responder=lambda request: (429, {"Retry-After": "3"}) if request["sequence"] == 1 else 202
@@ -296,3 +323,27 @@ def test_store_rejects_invalid_or_oversized_persistence_limit(tmp_path):
     )
     with pytest.raises(ValueError, match="Invalid Alitycs persistence file"):
         FileBatchStore(str(state_file), max_pending_events=1)
+
+
+@pytest.mark.parametrize(
+    "batches",
+    [
+        [{"batch_id": 42, "body": "{}", "event_count": 1, "paused_until": None}],
+        [{"batch_id": "batch", "body": {}, "event_count": 1, "paused_until": None}],
+        [{"batch_id": "batch", "body": "{}", "event_count": True, "paused_until": None}],
+        [{"batch_id": "batch", "body": "{}", "event_count": 1, "paused_until": float("inf")}],
+        [{"batch_id": "batch", "body": "{}", "event_count": 1, "paused_until": 10**4000}],
+        [
+            {"batch_id": "duplicate", "body": "{}", "event_count": 1, "paused_until": None},
+            {"batch_id": "duplicate", "body": "{}", "event_count": 1, "paused_until": None},
+        ],
+    ],
+)
+def test_store_rejects_invalid_and_duplicate_records(tmp_path, batches):
+    import json
+
+    state_file = tmp_path / "alitycs-wal.json"
+    state_file.write_text(json.dumps({"version": 1, "batches": batches}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Invalid Alitycs persistence file"):
+        FileBatchStore(str(state_file))

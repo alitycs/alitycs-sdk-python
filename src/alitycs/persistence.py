@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 import threading
@@ -30,21 +31,49 @@ class FileBatchStore:
         if self._path is not None and self._path.is_file():
             try:
                 state = json.loads(self._path.read_text(encoding="utf-8"))
-                if state.get("version") != 1 or not isinstance(state.get("batches"), list):
+                if (
+                    not isinstance(state, dict)
+                    or state.get("version") != 1
+                    or not isinstance(state.get("batches"), list)
+                ):
                     raise ValueError("unsupported persistence schema")
                 for raw in state["batches"]:
+                    if not isinstance(raw, dict):
+                        raise ValueError("invalid persistence record")
+                    batch_id = raw.get("batch_id")
+                    body = raw.get("body")
+                    event_count = raw.get("event_count")
+                    paused_until = raw.get("paused_until")
+                    if (
+                        not isinstance(batch_id, str)
+                        or not isinstance(body, str)
+                        or not isinstance(event_count, int)
+                        or isinstance(event_count, bool)
+                        or event_count < 1
+                        or (
+                            paused_until is not None
+                            and (
+                                not isinstance(paused_until, (int, float))
+                                or isinstance(paused_until, bool)
+                                or not math.isfinite(float(paused_until))
+                            )
+                        )
+                    ):
+                        raise ValueError("invalid persistence record")
+                    if batch_id in self._records:
+                        raise ValueError("duplicate persistence record")
                     record = DurableBatchRecord(
-                        batch_id=str(raw["batch_id"]),
-                        body=str(raw["body"]),
-                        event_count=int(raw["event_count"]),
+                        batch_id=batch_id,
+                        body=body,
+                        event_count=event_count,
                         paused_until=(
-                            None if raw.get("paused_until") is None else float(raw["paused_until"])
+                            None if paused_until is None else float(paused_until)
                         ),
                     )
                     self._records[record["batch_id"]] = record
                 if self.pending_events > self._max_pending_events:
                     raise ValueError("persistence event limit exceeded")
-            except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            except (OSError, TypeError, ValueError, OverflowError, KeyError, json.JSONDecodeError) as exc:
                 raise ValueError(f"Invalid Alitycs persistence file: {self._path}") from exc
 
     @property

@@ -429,6 +429,70 @@ def test_flush_reports_durable_background_failure_as_undelivered():
     manager.shutdown()
 
 
+def test_shutdown_persists_queued_events_fifo_when_recovery_is_blocked():
+    durable_pending = [1]
+    persisted = []
+
+    def persist(payload: BatchPayload) -> bool:
+        persisted.append(payload)
+        durable_pending[0] += len(payload.events)
+        return True
+
+    manager = BatchManager(
+        flush_size=10,
+        flush_interval=None,
+        max_queue_size=10,
+        send_fn=lambda payload: None,
+        recover_fn=lambda: False,
+        durable_pending_fn=lambda: durable_pending[0],
+        durable=True,
+        persist_fn=persist,
+    )
+    for name in ("a", "b", "c"):
+        manager.add(make_event(name))
+
+    manager.shutdown(join_timeout=2)
+
+    assert [[event.event for event in payload.events] for payload in persisted] == [
+        ["a"],
+        ["b"],
+        ["c"],
+    ]
+    assert manager.pending == 4
+    assert manager.lost_total == 0
+
+
+def test_shutdown_counts_only_unpersisted_suffix_as_lost():
+    durable_pending = [1]
+    persisted = []
+
+    def persist(payload: BatchPayload) -> bool:
+        if persisted:
+            return False
+        persisted.append(payload)
+        durable_pending[0] += 1
+        return True
+
+    manager = BatchManager(
+        flush_size=10,
+        flush_interval=None,
+        max_queue_size=10,
+        send_fn=lambda payload: None,
+        recover_fn=lambda: False,
+        durable_pending_fn=lambda: durable_pending[0],
+        durable=True,
+        persist_fn=persist,
+    )
+    for name in ("saved", "lost-1", "lost-2"):
+        manager.add(make_event(name))
+
+    manager.shutdown(join_timeout=2)
+
+    assert [event.event for event in persisted[0].events] == ["saved"]
+    assert manager.pending == 2
+    assert manager.lost_total == 2
+
+
 def test_send_failure_keeps_events_queued_and_reports_false():
     """Failures are honest: the event is re-queued at the head (not dropped), flush
     reports False, and a later flush after recovery delivers it."""

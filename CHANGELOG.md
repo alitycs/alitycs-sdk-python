@@ -11,7 +11,8 @@ here before a version tag is created.
 - Optional `persistence_path` exact-batch write-ahead logging. A serialized in-flight batch is
   stored atomically before its first attempt and replayed byte-identically after restart,
   including any remaining final `Retry-After` deadline. Terminal responses acknowledge the WAL;
-  pre-flush in-memory events remain outside this durability boundary.
+  if older durable recovery is blocked during shutdown, accepted in-memory events are appended
+  to the WAL in FIFO order instead of disappearing with the process.
 
 ### Added
 - Config validation for `request_timeout`, `retry_backoff_base`, and `session_timeout` at

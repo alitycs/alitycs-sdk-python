@@ -88,6 +88,7 @@ class Alitycs:
                 recover_fn=self._transport.recover,
                 durable_pending_fn=lambda: self._transport.durable_pending_events,
                 durable=self._transport.durable_enabled,
+                persist_fn=self._transport.persist,
             )
             if self._config.batching
             else None

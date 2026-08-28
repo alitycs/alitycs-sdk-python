@@ -36,6 +36,7 @@ SendFn = Callable[[BatchPayload], Optional[Union[SendSuccess, SendRejected, Send
 Clock = Callable[[], float]
 RecoverFn = Callable[[], bool]
 DurablePendingFn = Callable[[], int]
+PersistFn = Callable[[BatchPayload], bool]
 
 # Outcome of one dispatched batch.
 _OK = "ok"  # every event delivered
@@ -63,6 +64,7 @@ class BatchManager:
         recover_fn: Optional[RecoverFn] = None,
         durable_pending_fn: Optional[DurablePendingFn] = None,
         durable: bool = False,
+        persist_fn: Optional[PersistFn] = None,
     ) -> None:
         self._flush_size = flush_size
         self._flush_interval = flush_interval
@@ -73,6 +75,7 @@ class BatchManager:
         self._recover_fn = recover_fn
         self._durable_pending_fn = durable_pending_fn
         self._durable = durable
+        self._persist_fn = persist_fn
 
         self._cv = threading.Condition()
         self._queue: "deque[AnalyticsEvent]" = deque()
@@ -194,8 +197,12 @@ class BatchManager:
             thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(join_timeout)
+        # A timed-out join must not let the fallback snapshot race a worker that can
+        # still re-queue its in-flight batch after shutdown returns.
+        self._wait_for_inflight(None)
         # Safety net: if the worker died or the join timed out, finish the drain inline.
-        self.flush()
+        if not self.flush():
+            self._persist_queued_for_shutdown()
 
     def reset_for_child(self) -> None:
         """Post-``os.fork`` repair, run in the child only.
@@ -236,6 +243,9 @@ class BatchManager:
                         return
                 outcome = self._send_batch(batch)
                 if outcome == _TRANSIENT:
+                    with self._cv:
+                        if self._stopping:
+                            return
                     # Survivors were re-queued at the head; back off before retrying so
                     # a downed endpoint does not turn into a hot loop.
                     time.sleep(_WORKER_RETRY_BACKOFF_SECONDS)
@@ -320,6 +330,40 @@ class BatchManager:
         except Exception as exc:  # noqa: BLE001 - persistence/network failures are reported
             warn(f"Durable batch recovery failed ({type(exc).__name__}: {exc})")
             return False
+
+    def _persist_queued_for_shutdown(self) -> None:
+        """Persist queued work FIFO when an older durable batch blocks recovery."""
+        with self._cv:
+            queued = list(self._queue)
+            self._queue.clear()
+
+        if not queued:
+            return
+        if not self._durable or self._persist_fn is None:
+            with self._cv:
+                self._lost_count += len(queued)
+            warn(f"Shutdown could not deliver {len(queued)} queued event(s) — persistence unavailable")
+            return
+
+        for index, event in enumerate(queued):
+            payload = BatchPayload(
+                batch_id=f"batch_{generate_id()}",
+                sent_at=now_ms(),
+                events=[event],
+            )
+            try:
+                persisted = self._persist_fn(payload)
+            except Exception as exc:  # noqa: BLE001 - count the unresolved suffix honestly
+                warn(f"Shutdown persistence failed ({type(exc).__name__}: {exc})")
+                persisted = False
+            if persisted:
+                continue
+
+            lost = len(queued) - index
+            with self._cv:
+                self._lost_count += lost
+            warn(f"Shutdown persistence failed — {lost} queued event(s) lost")
+            return
 
     def _deliver(self, events: List[AnalyticsEvent], remaining_sends: List[int]) -> str:
         if remaining_sends[0] <= 0:
