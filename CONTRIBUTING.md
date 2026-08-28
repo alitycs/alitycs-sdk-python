@@ -5,15 +5,20 @@ signal safety, bounded delivery, and honest lifecycle outcomes.
 
 Run these checks before opening a pull request:
 
+Run the complete local gate with CPython 3.11 through 3.14. The SDK remains compatible with
+Python 3.9, which CI verifies separately, but the pinned CodeRabbit schema validator requires a
+newer interpreter. Set `PYTHON_BIN` explicitly when `python3` is older than 3.11:
+
 ```bash
-python -m pip install --require-hashes -r requirements-dev.txt
-python -m pip install --no-deps --no-build-isolation -e .
-python -m ruff check src tests scripts/e2e_run.py
-python -m pytest --cov=alitycs --cov-branch --cov-report=json --cov-fail-under=90
-python scripts/coverage_gate.py
-python -m build --no-isolation
+PYTHON_BIN="${PYTHON_BIN:-python3.11}"
+"$PYTHON_BIN" -m pip install --require-hashes -r requirements-dev.txt
+"$PYTHON_BIN" -m pip install --no-deps --no-build-isolation -e .
+"$PYTHON_BIN" -m ruff check src tests scripts/e2e_run.py
+"$PYTHON_BIN" -m pytest --cov=alitycs --cov-branch --cov-report=json --cov-fail-under=90
+"$PYTHON_BIN" scripts/coverage_gate.py
+"$PYTHON_BIN" -m build --no-isolation
 ./scripts/verify-workflow-pins.rb
-./scripts/validate-coderabbit.sh
+PYTHON_BIN="$PYTHON_BIN" ./scripts/validate-coderabbit.sh
 ./scripts/test-coderabbit-policy.rb
 ```
 
