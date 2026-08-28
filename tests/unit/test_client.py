@@ -177,6 +177,7 @@ class TestInstanceBasics:
         sender = threading.Thread(target=lambda: client.track("blocked_inline"))
         sender.start()
         assert started.wait(2)
+        assert client.pending == 1
 
         observed = []
         reader_done = threading.Event()
@@ -208,6 +209,38 @@ class TestInstanceBasics:
         reader.join(timeout=2)
         shutdown_thread.join(timeout=2)
         assert not sender.is_alive()
+        assert client.pending == 0
+
+    def test_durable_inline_pending_counts_persisted_active_send_once(
+        self, capture_server, tmp_path
+    ):
+        started = threading.Event()
+        release = threading.Event()
+        client = Alitycs(
+            api_key="pk_inline_pending",
+            endpoint=capture_server.url,
+            batching=False,
+            max_retries=0,
+            persistence_path=str(tmp_path / "inline-pending-wal.json"),
+        )
+
+        def blocked_post(body, request_timeout=None):  # noqa: ARG001 - transport fake
+            started.set()
+            release.wait(5)
+            return 202, None
+
+        client._transport._post = blocked_post
+        sender = threading.Thread(target=lambda: client.track("durable_inline"))
+        sender.start()
+        assert started.wait(2)
+
+        assert client.pending == 1
+
+        release.set()
+        sender.join(timeout=2)
+        assert not sender.is_alive()
+        assert client.pending == 0
+        client.shutdown(join_timeout=2.0)
 
     def test_unbounded_repeat_shutdown_recovers_inline_wal_after_finite_shutdown(
         self, capture_factory, tmp_path

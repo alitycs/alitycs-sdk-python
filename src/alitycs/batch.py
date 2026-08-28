@@ -25,7 +25,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from typing import Callable, List, Optional, Union
+from typing import Callable, List, Optional, Set, Tuple, Union
 
 from .transport import SendFailed, SendRejected, SendSuccess
 from .types import AnalyticsEvent, BatchPayload
@@ -39,6 +39,7 @@ DeadlineSendFn = Callable[
 Clock = Callable[[], float]
 RecoverFn = Callable[[Optional[float]], bool]
 DurablePendingFn = Callable[[], int]
+DurablePendingSnapshotFn = Callable[[List[str]], Tuple[int, int]]
 PersistFn = Callable[[BatchPayload], bool]
 
 # Outcome of one dispatched batch.
@@ -69,6 +70,7 @@ class BatchManager:
         durable: bool = False,
         persist_fn: Optional[PersistFn] = None,
         send_with_deadline_fn: Optional[DeadlineSendFn] = None,
+        durable_pending_snapshot_fn: Optional[DurablePendingSnapshotFn] = None,
     ) -> None:
         self._flush_size = flush_size
         self._flush_interval = flush_interval
@@ -81,10 +83,12 @@ class BatchManager:
         self._durable = durable
         self._persist_fn = persist_fn
         self._send_with_deadline_fn = send_with_deadline_fn
+        self._durable_pending_snapshot_fn = durable_pending_snapshot_fn
 
         self._cv = threading.Condition()
         self._queue: "deque[AnalyticsEvent]" = deque()
         self._inflight = 0
+        self._active_batch_ids: Set[str] = set()
         self._stopping = False
         self._closed = False
         self._finite_shutdown_complete = False
@@ -100,6 +104,11 @@ class BatchManager:
         """Events queued, in flight, or persisted for restart."""
         with self._cv:
             memory_pending = len(self._queue) + self._inflight
+            active_batch_ids = list(self._active_batch_ids)
+            inflight = self._inflight
+        if self._durable_pending_snapshot_fn is not None:
+            durable_pending, overlap = self._durable_pending_snapshot_fn(active_batch_ids)
+            return memory_pending + durable_pending - min(overlap, inflight)
         durable_pending = 0 if self._durable_pending_fn is None else self._durable_pending_fn()
         return memory_pending + durable_pending
 
@@ -242,6 +251,7 @@ class BatchManager:
         with self._cv:
             self._thread = None
             self._inflight = 0  # the parent's in-flight send can never complete here
+            self._active_batch_ids.clear()
             self._queue.clear()
             self._next_tick = self._clock() + self._flush_interval if self._flush_interval else None
 
@@ -335,18 +345,23 @@ class BatchManager:
     ) -> str:
         """Dispatch one batch. Returns ``_OK``, ``_REJECTED``, or ``_TRANSIENT``
         (with survivors re-queued at the head). Never raises."""
+        active_batch_ids: List[str] = []
         try:
             if not self._recover_durable(deadline):
                 self._requeue_at_head(batch)
                 result = _TRANSIENT
             else:
-                result = self._deliver(list(batch), [_MAX_SPLIT_SENDS], deadline)
+                result = self._deliver(
+                    list(batch), [_MAX_SPLIT_SENDS], deadline, active_batch_ids
+                )
         except Exception as exc:  # noqa: BLE001 - delivery must never crash the host
             warn(f"Batch dispatch failed ({type(exc).__name__}: {exc})")
             self._requeue_at_head(batch)
             result = _TRANSIENT
         finally:
             with self._cv:
+                for batch_id in active_batch_ids:
+                    self._active_batch_ids.discard(batch_id)
                 self._inflight -= len(batch)
                 self._cv.notify_all()
         return result
@@ -399,6 +414,7 @@ class BatchManager:
         events: List[AnalyticsEvent],
         remaining_sends: List[int],
         deadline: Optional[float] = None,
+        active_batch_ids: Optional[List[str]] = None,
     ) -> str:
         if remaining_sends[0] <= 0:
             with self._cv:
@@ -413,6 +429,10 @@ class BatchManager:
             sent_at=now_ms(),
             events=list(events),
         )
+        if active_batch_ids is not None:
+            with self._cv:
+                self._active_batch_ids.add(payload.batch_id)
+                active_batch_ids.append(payload.batch_id)
         try:
             outcome = (
                 self._send_fn(payload)
@@ -429,8 +449,12 @@ class BatchManager:
                 # half and retry each side so valid events still land; depth is bounded
                 # by log2(len(events)).
                 mid = len(events) // 2
-                left = self._deliver(events[:mid], remaining_sends, deadline)
-                right = self._deliver(events[mid:], remaining_sends, deadline)
+                left = self._deliver(
+                    events[:mid], remaining_sends, deadline, active_batch_ids
+                )
+                right = self._deliver(
+                    events[mid:], remaining_sends, deadline, active_batch_ids
+                )
                 if _TRANSIENT in (left, right):
                     return _TRANSIENT
                 return _OK if _REJECTED not in (left, right) else _REJECTED

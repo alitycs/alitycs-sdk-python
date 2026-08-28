@@ -18,7 +18,7 @@ import time
 from datetime import timezone
 import urllib.error
 import urllib.request
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, Iterable, Optional, Tuple, Union
 
 from .persistence import FileBatchStore
 from .types import BatchPayload
@@ -176,6 +176,10 @@ class HttpTransport:
     @property
     def durable_pending_events(self) -> int:
         return self._store.pending_events
+
+    def durable_pending_snapshot(self, active_batch_ids: Iterable[str]) -> Tuple[int, int]:
+        """Return durable events and those duplicated by active caller counters."""
+        return self._store.pending_snapshot(active_batch_ids)
 
     @property
     def durable_enabled(self) -> bool:

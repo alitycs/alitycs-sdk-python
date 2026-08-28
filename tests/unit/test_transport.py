@@ -227,6 +227,21 @@ def test_persist_stores_without_network_then_recovery_delivers(capture_server, t
     assert capture_server.requests[0]["payload"]["batchId"] == payload.batch_id
 
 
+def test_durable_pending_snapshot_reports_active_overlap(capture_server, tmp_path):
+    transport = make_transport(
+        capture_server,
+        max_retries=0,
+        persistence_path=str(tmp_path / "pending-snapshot-wal.json"),
+    )
+    payload = make_payload("snapshot")
+
+    assert transport.persist(payload) is True
+    assert transport.durable_pending_snapshot([payload.batch_id]) == (1, 1)
+    assert transport.durable_pending_snapshot(["batch_elsewhere"]) == (1, 0)
+    transport.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX persistence parent validation")
 def test_unavailable_persistence_parent_fails_initialization_without_network(
     capture_server, tmp_path
 ):

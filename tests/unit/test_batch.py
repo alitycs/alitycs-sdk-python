@@ -5,7 +5,7 @@ import time
 from typing import List
 
 from alitycs.batch import BatchManager
-from alitycs.transport import SendFailed, SendRejected
+from alitycs.transport import SendFailed, SendRejected, SendSuccess
 from alitycs.types import AnalyticsEvent, BatchPayload, EventContext, EventType
 
 
@@ -147,6 +147,46 @@ def test_flush_resolves_only_after_the_in_flight_send_lands():
     assert sent.wait_for_events(4)
     assert sorted(sent.event_names) == ["a", "b", "c", "d"]
     assert manager.pending == 0
+
+
+def test_durable_pending_counts_an_active_persisted_batch_once():
+    started = threading.Event()
+    release = threading.Event()
+    records = {}
+    records_lock = threading.Lock()
+
+    def send(payload: BatchPayload):
+        with records_lock:
+            records[payload.batch_id] = len(payload.events)
+        started.set()
+        release.wait(5)
+        with records_lock:
+            records.pop(payload.batch_id, None)
+        return SendSuccess()
+
+    def pending_snapshot(active_batch_ids):
+        with records_lock:
+            total = sum(records.values())
+            overlap = sum(records.get(batch_id, 0) for batch_id in active_batch_ids)
+            return total, overlap
+
+    manager = BatchManager(
+        flush_size=1,
+        flush_interval=None,
+        max_queue_size=10,
+        send_fn=send,
+        durable=True,
+        durable_pending_snapshot_fn=pending_snapshot,
+    )
+    manager.add(make_event("durable-active"))
+    assert started.wait(2)
+
+    assert manager.pending == 1
+
+    release.set()
+    assert manager.flush(timeout=2)
+    assert manager.pending == 0
+    manager.shutdown()
 
 
 def test_shutdown_drains_everything_queued():

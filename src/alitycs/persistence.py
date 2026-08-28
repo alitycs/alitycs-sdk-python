@@ -8,7 +8,7 @@ import os
 import tempfile
 import threading
 from pathlib import Path
-from typing import Dict, List, Optional, Set, TypedDict
+from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict
 
 try:  # POSIX advisory locking; the in-process registry remains the portable floor.
     import fcntl
@@ -203,6 +203,22 @@ class FileBatchStore:
     def pending_events(self) -> int:
         with self._lock:
             return sum(record["event_count"] for record in self._records.values())
+
+    def pending_snapshot(self, active_batch_ids: Iterable[str]) -> Tuple[int, int]:
+        """Return total durable events and the subset owned by active local sends.
+
+        Both values come from one store-lock snapshot so callers can subtract the
+        durable/in-memory overlap without racing a concurrent ``put`` or
+        ``acknowledge``.
+        """
+        with self._lock:
+            total = sum(record["event_count"] for record in self._records.values())
+            overlap = sum(
+                self._records[batch_id]["event_count"]
+                for batch_id in set(active_batch_ids)
+                if batch_id in self._records
+            )
+            return total, overlap
 
     def contains(self, batch_id: str) -> bool:
         with self._lock:

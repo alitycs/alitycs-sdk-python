@@ -7,7 +7,7 @@ import os
 import signal
 import threading
 import time
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Set
 
 from .batch import BatchManager
 from .config import DEFAULT_ENDPOINT, AlitycsConfig
@@ -92,6 +92,7 @@ class Alitycs:
                 durable=self._transport.durable_enabled,
                 persist_fn=self._transport.persist,
                 send_with_deadline_fn=self._transport.send,
+                durable_pending_snapshot_fn=self._transport.durable_pending_snapshot,
             )
             if self._config.batching
             else None
@@ -101,6 +102,7 @@ class Alitycs:
         self._lifecycle_lock = threading.RLock()
         self._inline_idle = threading.Condition(self._lifecycle_lock)
         self._inline_inflight = 0
+        self._inline_batch_ids: Set[str] = set()
         self._closed = False
         self._user_id: Optional[str] = None
         self._global_properties: Dict[str, Any] = {}
@@ -121,7 +123,13 @@ class Alitycs:
     def pending(self) -> int:
         """Events not yet delivered: queued plus in an in-flight send."""
         if self._batch_manager is None:
-            return self._transport.durable_pending_events
+            with self._inline_idle:
+                inline_inflight = self._inline_inflight
+                active_batch_ids = list(self._inline_batch_ids)
+            durable_pending, overlap = self._transport.durable_pending_snapshot(
+                active_batch_ids
+            )
+            return inline_inflight + durable_pending - min(overlap, inline_inflight)
         return self._batch_manager.pending
 
     @property
@@ -299,21 +307,23 @@ class Alitycs:
             # Batching disabled: deliver inline; failures are reported, not hidden.
             # Admission is guarded, but network I/O happens outside the lifecycle lock
             # so readers and shutdown are never serialized behind retries or backoff.
+            payload = BatchPayload(
+                batch_id=f"batch_{generate_id()}",
+                sent_at=now_ms(),
+                events=[event],
+            )
             with self._inline_idle:
                 if self._closed:
                     if self._config.debug:
                         debug_warn("Client shut down — dropping event")
                     return
                 self._inline_inflight += 1
-            payload = BatchPayload(
-                batch_id=f"batch_{generate_id()}",
-                sent_at=now_ms(),
-                events=[event],
-            )
+                self._inline_batch_ids.add(payload.batch_id)
             try:
                 outcome = self._transport.send(payload)
             finally:
                 with self._inline_idle:
+                    self._inline_batch_ids.discard(payload.batch_id)
                     self._inline_inflight -= 1
                     self._inline_idle.notify_all()
             if isinstance(outcome, SendRejected):
@@ -331,6 +341,7 @@ class Alitycs:
         self._lifecycle_lock = threading.RLock()
         self._inline_idle = threading.Condition(self._lifecycle_lock)
         self._inline_inflight = 0
+        self._inline_batch_ids = set()
 
 
 # Module-level convenience API over a default instance ----------------------------
