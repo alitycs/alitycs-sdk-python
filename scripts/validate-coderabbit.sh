@@ -8,7 +8,7 @@ repository_root="$(cd -- "$script_dir/.." && pwd -P)"
 readonly repository_root
 readonly requirements_path="$script_dir/coderabbit-validator-requirements.txt"
 readonly schema_path="$script_dir/coderabbit-schema.v2.json"
-readonly schema_sha256="7a933a5461870f5d722751629e57b6e343d358a1887b0f9f2e7d6f0ccbf48e5a"
+readonly schema_sha256="8b97de5ffa369607df632603bb830b6e8f1f470f58d2c4582cb5871a1a3c2bb7"
 readonly python_bin="${PYTHON_BIN:-python3}"
 
 "$python_bin" - "$schema_path" "$schema_sha256" <<'PY'
