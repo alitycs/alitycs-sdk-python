@@ -57,7 +57,7 @@ Alitycs(
     batching=True,               # False sends each event inline
     request_timeout=10.0,
     retry_backoff_base=1.0,
-    persistence_path=None,      # optional exact in-flight batch WAL file
+    persistence_path=None,       # optional exact in-flight batch WAL file
 )
 ```
 
@@ -70,14 +70,19 @@ Alitycs(
 - **No silent loss**: delivery failures and local rejections are logged at warn level
   (never hidden behind `debug`) and counted — see `pending`, `rejected_locally`,
   plus `delivered_total` / `requeued_total` / `lost_total` on the batch manager.
-- **Split-on-rejection**: the server rejects an entire batch when one event violates
-  an ingestion limit, so the SDK splits a rejected batch in half and retries each
-  half until only invalid singles remain.
+- **Split-on-rejection**: an HTTP 400 can mean one event poisoned a whole batch, so the
+  SDK splits that response in half to isolate valid events, with a hard cap of 64 sends.
+  Authentication, authorization, redirect, and other permanent responses are never split.
 - Retries reuse the exact batch body so `batchId` stays stable for server-side dedup.
+- SDK-generated exponential backoff is capped at 10 seconds. A server `Retry-After`
+  replaces that generated delay and is not shortened to the client cap.
 - A new process using the same `persistence_path` replays retained bodies on
   `flush()`/`shutdown()` and honors any remaining persisted `Retry-After` deadline. The WAL starts
   immediately before the first network attempt, so it does not cover events still waiting in the
-  in-memory pre-flush queue. Use one client process per path.
+  in-memory pre-flush queue and is capped at `max_queue_size` retained events. Use one client
+  process per path. After a fork, the child drops its
+  copy of the parent-owned queue and detaches from the inherited WAL; create a fresh client with a
+  child-specific path when child delivery also needs durability.
 
 ## Ingestion limits
 

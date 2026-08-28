@@ -37,6 +37,8 @@ class AlitycsConfig:
             raise ValueError("endpoint is required")
         _require_positive_int(self, "flush_size")
         _require_positive_int(self, "max_queue_size")
+        if self.flush_size > self.max_queue_size:
+            raise ValueError("flush_size must not exceed max_queue_size")
         if not isinstance(self.max_retries, int) or isinstance(self.max_retries, bool) or self.max_retries < 0:
             raise ValueError("max_retries must be a non-negative integer")
         if self.flush_interval is not None and self.flush_interval <= 0:

@@ -133,20 +133,15 @@ class TestInstanceBasics:
         client.track("inline_doomed")  # must not raise despite the 500
         client.shutdown(join_timeout=2.0)
 
-    def test_queue_full_drops_events_without_raising(self, capture_server):
-        client = Alitycs(
-            api_key="pk_unit",
-            endpoint=capture_server.url,
-            flush_size=100,
-            flush_interval=None,
-            max_queue_size=2,
-        )
-        client.track("q1")
-        client.track("q2")
-        client.track("q3")  # over the cap: dropped loudly
-        assert client.flush()
-        assert sorted(capture_server.event_names) == ["q1", "q2"]
-        client.shutdown(join_timeout=2.0)
+    def test_unreachable_flush_threshold_is_rejected(self, capture_server):
+        with pytest.raises(ValueError, match="flush_size"):
+            Alitycs(
+                api_key="pk_unit",
+                endpoint=capture_server.url,
+                flush_size=100,
+                flush_interval=None,
+                max_queue_size=2,
+            )
 
     def test_oversized_property_is_rejected_locally_and_never_queued(self, capture_server, capsys):
         client = self._client_with(capture_server)
@@ -286,6 +281,18 @@ class TestModuleLevelApi:
         assert client.is_shutdown is False
         client.shutdown(join_timeout=2.0)
         assert client.is_shutdown is True
+
+    def test_non_batching_client_stays_closed_after_shutdown(self, capture_server):
+        client = Alitycs(
+            api_key="pk_inline_closed",
+            endpoint=capture_server.url,
+            batching=False,
+            max_retries=0,
+        )
+        client.shutdown(join_timeout=2.0)
+        assert client.is_shutdown is True
+        client.track("must_not_send")
+        assert capture_server.requests == []
 
 
 class TestProcessHooks:

@@ -16,6 +16,7 @@ from .transport import HttpTransport, SendFailed, SendRejected
 from .types import AnalyticsEvent, BatchPayload, EventType, RevenuePayload
 from .utils import (
     EventRejectedError,
+    debug_warn,
     generate_id,
     now_ms,
     serialize_properties,
@@ -74,6 +75,7 @@ class Alitycs:
             retry_backoff_base=self._config.retry_backoff_base,
             debug=self._config.debug,
             persistence_path=self._config.persistence_path,
+            max_pending_events=self._config.max_queue_size,
         )
         self._session_manager = SessionManager(self._config.session_timeout)
         self._batch_manager: Optional[BatchManager] = (
@@ -92,6 +94,8 @@ class Alitycs:
         )
         # Guards identity and global property mutations across threads.
         self._identity_lock = threading.RLock()
+        self._lifecycle_lock = threading.RLock()
+        self._closed = False
         self._user_id: Optional[str] = None
         self._global_properties: Dict[str, Any] = {}
         self._rejected_locally_count = 0
@@ -104,7 +108,8 @@ class Alitycs:
     @property
     def is_shutdown(self) -> bool:
         """True once :meth:`shutdown` has run; a shut-down client accepts no events."""
-        return self._batch_manager is not None and self._batch_manager.closed
+        with self._lifecycle_lock:
+            return self._closed
 
     @property
     def pending(self) -> int:
@@ -219,9 +224,12 @@ class Alitycs:
     def shutdown(self, join_timeout: Optional[float] = _DEFAULT_SHUTDOWN_JOIN_TIMEOUT) -> None:
         """Stop accepting events and drain fully. Safe to call from ``atexit``
         handlers and more than once."""
+        with self._lifecycle_lock:
+            already_closed = self._closed
+            self._closed = True
         if self._batch_manager is not None:
             self._batch_manager.shutdown(join_timeout)
-        else:
+        elif not already_closed:
             self._transport.recover()
         _LIVE_INSTANCES.discard(self)
 
@@ -265,26 +273,40 @@ class Alitycs:
             return
 
         if self._batch_manager is not None:
-            self._batch_manager.add(event)
+            with self._lifecycle_lock:
+                if self._closed:
+                    if self._config.debug:
+                        debug_warn("Client shut down — dropping event")
+                    return
+                self._batch_manager.add(event)
         else:
             # Batching disabled: deliver inline; failures are reported, not hidden.
-            payload = BatchPayload(
-                batch_id=f"batch_{generate_id()}",
-                sent_at=now_ms(),
-                events=[event],
-            )
-            outcome = self._transport.send(payload)
+            # Holding the lifecycle lock gives shutdown an exact admission boundary:
+            # either this inline delivery completes first, or it is refused below.
+            with self._lifecycle_lock:
+                if self._closed:
+                    if self._config.debug:
+                        debug_warn("Client shut down — dropping event")
+                    return
+                payload = BatchPayload(
+                    batch_id=f"batch_{generate_id()}",
+                    sent_at=now_ms(),
+                    events=[event],
+                )
+                outcome = self._transport.send(payload)
             if isinstance(outcome, SendRejected):
                 warn(f"Server rejected event {event.event_id} with HTTP {outcome.status}")
             elif isinstance(outcome, SendFailed):
                 warn(f"Transport failure ({outcome.reason}) — event {event.event_id} not delivered")
 
     def _reset_for_child(self) -> None:
-        """Post-fork repair in the child process: drop inherited locks and forget the
-        parent's flusher thread so a fresh one starts lazily."""
-        self._batch_manager.reset_for_child()
+        """Post-fork repair without replaying the parent's queued or durable work."""
+        if self._batch_manager is not None:
+            self._batch_manager.reset_for_child()
+        self._transport.reset_for_child()
         self._session_manager.reset_for_child()
         self._identity_lock = threading.RLock()
+        self._lifecycle_lock = threading.RLock()
 
 
 # Module-level convenience API over a default instance ----------------------------

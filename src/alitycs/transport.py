@@ -15,6 +15,7 @@ import email.utils
 import json
 import threading
 import time
+from datetime import timezone
 import urllib.error
 import urllib.request
 from typing import Callable, Optional, Tuple, Union
@@ -87,6 +88,7 @@ class HttpTransport:
         debug: bool = False,
         sleep: Optional[Sleep] = None,
         persistence_path: Optional[str] = None,
+        max_pending_events: int = 1000,
     ) -> None:
         self.endpoint = endpoint
         self.api_key = api_key
@@ -95,16 +97,22 @@ class HttpTransport:
         self.retry_backoff_base = retry_backoff_base
         self.debug = debug
         self._sleep: Sleep = sleep if sleep is not None else time.sleep
-        self._store = FileBatchStore(persistence_path)
+        self._store = FileBatchStore(persistence_path, max_pending_events)
         self._delivery_lock = threading.RLock()
 
     def send(self, payload: BatchPayload) -> SendOutcome:
         """POST one batch until it succeeds, is rejected as non-retryable, or retries
         run out. Returns a :class:`SendOutcome`; never raises."""
-        body = json.dumps(payload.to_dict(), separators=(",", ":")).encode("utf-8")
-        with self._delivery_lock:
-            self._store.put(payload.batch_id, body, len(payload.events))
-            return self._send_record(payload.batch_id, body)
+        try:
+            body = json.dumps(payload.to_dict(), separators=(",", ":")).encode("utf-8")
+            with self._delivery_lock:
+                self._store.put(payload.batch_id, body, len(payload.events))
+                return self._send_record(payload.batch_id, body)
+        except Exception as exc:  # noqa: BLE001 - persistence failures are delivery outcomes
+            durable = self._store.enabled and self._store.contains(payload.batch_id)
+            reason = f"{type(exc).__name__}: {exc}"
+            warn(f"Transport persistence failed — delivery unresolved: {reason}")
+            return SendFailed(reason, durable=durable)
 
     def recover(self) -> bool:
         """Replay persisted bodies exactly, honoring any remaining Retry-After pause."""
@@ -116,9 +124,20 @@ class HttpTransport:
                     if remaining > 0:
                         self._sleep(remaining)
                 outcome = self._send_record(record["batch_id"], record["body"].encode("utf-8"))
-                if not isinstance(outcome, SendSuccess):
+                # Terminal responses have already been acknowledged and must not block
+                # later durable batches. Only a transient failure stops ordered replay.
+                if isinstance(outcome, SendFailed):
                     return False
             return True
+
+    def reset_for_child(self) -> None:
+        """Replace inherited locks and detach the child from the parent's WAL."""
+        self._delivery_lock = threading.RLock()
+        if self._store.reset_for_child():
+            warn(
+                "Fork detected — inherited persistence disabled in child; create a new "
+                "client with a child-specific persistence_path for durable child delivery"
+            )
 
     @property
     def durable_pending_events(self) -> int:
@@ -135,11 +154,12 @@ class HttpTransport:
 
         for attempt in range(self.max_retries + 1):
             if attempt > 0:
-                # A 429's Retry-After (delta-seconds or HTTP-date) replaces the default
-                # backoff for the attempt that follows it, still capped at ten seconds.
-                delay = min(self.retry_backoff_base * (2 ** (attempt - 1)), _MAX_BACKOFF_SECONDS)
+                # Exponential backoff is capped; a server Retry-After is authoritative
+                # and therefore is not shortened to the client backoff cap.
+                exponent = min(attempt - 1, 63)
+                delay = min(self.retry_backoff_base * (2**exponent), _MAX_BACKOFF_SECONDS)
                 if retry_after is not None:
-                    delay = min(max(retry_after, 0.0), _MAX_BACKOFF_SECONDS)
+                    delay = max(retry_after, 0.0)
                     retry_after = None
                 if self.debug:
                     debug_warn(f"Transport: attempt {attempt} failed ({last_error}), retrying in {delay:.1f}s")
@@ -167,9 +187,13 @@ class HttpTransport:
                 retry_after_until = None if retry_after is None else time.time() + retry_after
             last_error = f"HTTP {status}"
 
-        self._store.pause(batch_id, retry_after_until)
-        warn(f"Transport: all retries exhausted — batch retained for restart: {last_error}")
-        return SendFailed(last_error, retry_after_until, durable=self._store.enabled)
+        durable = self._store.enabled
+        if durable:
+            self._store.pause(batch_id, retry_after_until)
+            warn(f"Transport: all retries exhausted — batch retained for restart: {last_error}")
+        else:
+            warn(f"Transport: all retries exhausted — batch not delivered: {last_error}")
+        return SendFailed(last_error, retry_after_until, durable=durable)
 
     def _post(self, body: bytes) -> Tuple[int, Optional[float]]:
         """Perform one POST and return ``(status, retry_after_seconds)`` without raising
@@ -203,10 +227,11 @@ def parse_retry_after(headers: Optional[object]) -> Optional[float]:
     if value is None:
         return None
     value = value.strip()
-    try:
-        return max(0.0, float(value))
-    except ValueError:
-        pass
+    if value.isascii() and value.isdigit():
+        try:
+            return float(int(value))
+        except (OverflowError, ValueError):
+            return None
     try:
         when = email.utils.parsedate_to_datetime(value)
     except (TypeError, ValueError):
@@ -214,5 +239,5 @@ def parse_retry_after(headers: Optional[object]) -> Optional[float]:
     if when is None:  # pragma: no cover - parsedate_to_datetime raises instead on bad input
         return None
     if when.tzinfo is None:
-        when = when.replace(tzinfo=time.timezone)
+        when = when.replace(tzinfo=timezone.utc)
     return max(0.0, when.timestamp() - time.time())

@@ -46,6 +46,10 @@ _TRANSIENT = "transient"  # transport failure; events re-queued at the head
 # hot-loop over re-queued events; explicit flushes retry immediately instead.
 _WORKER_RETRY_BACKOFF_SECONDS = 0.5
 
+# Whole-batch rejection isolation is useful but must not amplify one response into an
+# unbounded request storm when a caller configures a very large flush size.
+_MAX_SPLIT_SENDS = 64
+
 
 class BatchManager:
     def __init__(
@@ -194,14 +198,17 @@ class BatchManager:
         self.flush()
 
     def reset_for_child(self) -> None:
-        """Post-``os.fork`` repair, run in the child only. Locks are replaced untouched
-        (a parent thread may have held the inherited ones at fork time), the parent's
-        worker is forgotten, and queued events are kept so the child can deliver them
-        once a fresh worker starts lazily."""
+        """Post-``os.fork`` repair, run in the child only.
+
+        Locks are replaced because a parent thread may have held them at fork time. The
+        inherited queue is discarded: the parent still owns those events, and sending
+        the child's copy would double-count them.
+        """
         self._cv = threading.Condition()
         with self._cv:
             self._thread = None
             self._inflight = 0  # the parent's in-flight send can never complete here
+            self._queue.clear()
             self._next_tick = self._clock() + self._flush_interval if self._flush_interval else None
 
     # Internals ------------------------------------------------------------
@@ -294,7 +301,7 @@ class BatchManager:
                 self._requeue_at_head(batch)
                 result = _TRANSIENT
             else:
-                result = self._deliver(list(batch))
+                result = self._deliver(list(batch), [_MAX_SPLIT_SENDS])
         except Exception as exc:  # noqa: BLE001 - delivery must never crash the host
             warn(f"Batch dispatch failed ({type(exc).__name__}: {exc})")
             self._requeue_at_head(batch)
@@ -314,7 +321,15 @@ class BatchManager:
             warn(f"Durable batch recovery failed ({type(exc).__name__}: {exc})")
             return False
 
-    def _deliver(self, events: List[AnalyticsEvent]) -> str:
+    def _deliver(self, events: List[AnalyticsEvent], remaining_sends: List[int]) -> str:
+        if remaining_sends[0] <= 0:
+            with self._cv:
+                self._lost_count += len(events)
+            warn(
+                f"Batch rejection split limit reached — dropping {len(events)} unresolved event(s)"
+            )
+            return _REJECTED
+        remaining_sends[0] -= 1
         payload = BatchPayload(
             batch_id=f"batch_{generate_id()}",
             sent_at=now_ms(),
@@ -332,12 +347,13 @@ class BatchManager:
                 # half and retry each side so valid events still land; depth is bounded
                 # by log2(len(events)).
                 mid = len(events) // 2
-                left = self._deliver(events[:mid])
-                right = self._deliver(events[mid:])
+                left = self._deliver(events[:mid], remaining_sends)
+                right = self._deliver(events[mid:], remaining_sends)
                 if _TRANSIENT in (left, right):
                     return _TRANSIENT
                 return _OK if _REJECTED not in (left, right) else _REJECTED
-            self._lost_count += len(events)
+            with self._cv:
+                self._lost_count += len(events)
             warn(
                 f"Server rejected {len(events)} event(s) with HTTP {outcome.status} — "
                 "dropped, not retried"

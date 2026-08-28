@@ -20,8 +20,11 @@ class DurableBatchRecord(TypedDict):
 class FileBatchStore:
     """A single-process write-ahead log replaced atomically after every mutation."""
 
-    def __init__(self, path: Optional[str]) -> None:
+    def __init__(self, path: Optional[str], max_pending_events: int = 1000) -> None:
+        if max_pending_events < 1:
+            raise ValueError("Alitycs persistence max_pending_events must be positive")
         self._path = Path(path) if path is not None else None
+        self._max_pending_events = max_pending_events
         self._lock = threading.RLock()
         self._records: Dict[str, DurableBatchRecord] = {}
         if self._path is not None and self._path.is_file():
@@ -39,6 +42,8 @@ class FileBatchStore:
                         ),
                     )
                     self._records[record["batch_id"]] = record
+                if self.pending_events > self._max_pending_events:
+                    raise ValueError("persistence event limit exceeded")
             except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
                 raise ValueError(f"Invalid Alitycs persistence file: {self._path}") from exc
 
@@ -52,20 +57,34 @@ class FileBatchStore:
         with self._lock:
             if batch_id in self._records:
                 return
+            if event_count < 1 or self.pending_events + event_count > self._max_pending_events:
+                raise ValueError("Alitycs persistence event limit exceeded")
+            previous = self._copy_records()
             self._records[batch_id] = DurableBatchRecord(
                 batch_id=batch_id,
                 body=body.decode("utf-8"),
                 event_count=event_count,
                 paused_until=None,
             )
-            self._persist()
+            try:
+                self._persist()
+            except Exception:
+                self._records = previous
+                raise
 
     def acknowledge(self, batch_id: str) -> None:
         if not self.enabled:
             return
         with self._lock:
-            if self._records.pop(batch_id, None) is not None:
+            if batch_id not in self._records:
+                return
+            previous = self._copy_records()
+            self._records.pop(batch_id)
+            try:
                 self._persist()
+            except Exception:
+                self._records = previous
+                raise
 
     def pause(self, batch_id: str, paused_until: Optional[float]) -> None:
         if not self.enabled:
@@ -73,8 +92,29 @@ class FileBatchStore:
         with self._lock:
             record = self._records.get(batch_id)
             if record is not None:
+                previous = self._copy_records()
                 record["paused_until"] = paused_until
-                self._persist()
+                try:
+                    self._persist()
+                except Exception:
+                    self._records = previous
+                    raise
+
+    def reset_for_child(self) -> bool:
+        """Drop state and inherited locks after ``fork()``.
+
+        A persistence path has a single-process owner. Letting both parent and child
+        mutate the inherited snapshot can corrupt it or replay the same batches, so the
+        child continues in non-durable mode. Applications that need child durability
+        should create a fresh client with a child-specific path.
+
+        Returns ``True`` when inherited durable state was disabled.
+        """
+        inherited = self._path is not None
+        self._lock = threading.RLock()
+        self._records = {}
+        self._path = None
+        return inherited
 
     def snapshot(self) -> List[DurableBatchRecord]:
         with self._lock:
@@ -85,6 +125,10 @@ class FileBatchStore:
         with self._lock:
             return sum(record["event_count"] for record in self._records.values())
 
+    def contains(self, batch_id: str) -> bool:
+        with self._lock:
+            return batch_id in self._records
+
     def _persist(self) -> None:
         assert self._path is not None
         if not self._records:
@@ -92,6 +136,7 @@ class FileBatchStore:
                 self._path.unlink()
             except FileNotFoundError:
                 pass
+            self._sync_parent_best_effort()
             return
 
         self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -110,8 +155,26 @@ class FileBatchStore:
                 os.fsync(handle.fileno())
             os.chmod(temporary, 0o600)
             os.replace(temporary, self._path)
+            self._sync_parent_best_effort()
         finally:
             try:
                 os.unlink(temporary)
             except FileNotFoundError:
                 pass
+
+    def _copy_records(self) -> Dict[str, DurableBatchRecord]:
+        return {batch_id: record.copy() for batch_id, record in self._records.items()}  # type: ignore[misc]
+
+    def _sync_parent_best_effort(self) -> None:
+        """Persist directory metadata where the platform supports directory fsync."""
+        assert self._path is not None
+        try:
+            descriptor = os.open(self._path.parent, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(descriptor)
+        except OSError:
+            pass
+        finally:
+            os.close(descriptor)

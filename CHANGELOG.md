@@ -36,8 +36,8 @@ here before a version tag is created.
 
 ### Added
 - A 429 response's `Retry-After` header (delta-seconds or HTTP-date) is now honoured: the retry
-  after it waits at least that long instead of the default backoff, still capped at ten seconds.
-  Previously the header was ignored and rate-limited clients hammered through the rate limit.
+  after it waits at least that long instead of the default backoff. Only SDK-generated exponential
+  backoff is capped at ten seconds; server deadlines are not shortened.
 - Client-side enforcement of the canonical ingestion limits (identical to the server's
   `EventValidator`): ≤50 properties per event, property keys ≤100 chars, values ≤1000 chars,
   estimated event size ≤64KB, non-blank action plus `userId`/`anonymousId` required, epoch-millis
@@ -64,6 +64,17 @@ here before a version tag is created.
   being dropped, and `False` is returned so callers can retry.
 - Transport failures and server rejections are logged at warn level even when `debug` is off;
   delivery problems were previously invisible by default.
+- Fork repair now drops the child's copy of the parent-owned queue and disables the inherited WAL,
+  preventing duplicate delivery and cross-process snapshot corruption. Child processes that need
+  durability must create a fresh client with a child-specific `persistence_path`.
+- WAL growth is capped by `max_queue_size`; mutations roll back their in-memory state on
+  persistence errors and best-effort fsync the parent directory after replace/remove. Terminal
+  durable rejections no longer block later replay.
+- Retry parsing accepts RFC delay-seconds integers rather than arbitrary floats, event-size checks
+  count UTF-8 bytes, rejection splitting is capped at 64 sends, and unreachable configurations
+  where `flush_size > max_queue_size` fail during construction.
+- Non-batching clients now preserve the shutdown admission boundary and remain observably closed;
+  post-shutdown inline events cannot be sent.
 
 [Unreleased]: https://github.com/alitycs/alitycs-sdk-python/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/alitycs/alitycs-sdk-python/releases/tag/v1.0.0

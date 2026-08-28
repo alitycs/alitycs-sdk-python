@@ -2,6 +2,9 @@ import time
 from email.utils import formatdate
 from typing import List, Optional
 
+import pytest
+
+from alitycs.persistence import FileBatchStore
 from alitycs.transport import HttpTransport, SendFailed, SendRejected, SendSuccess, parse_retry_after
 from alitycs.types import AnalyticsEvent, BatchPayload, EventContext, EventType
 from tests.conftest import CaptureServer
@@ -120,14 +123,14 @@ def test_429_retry_after_http_date_is_honoured(capture_factory):
     assert 2.0 <= sleeps[0] <= 3.0
 
 
-def test_429_retry_after_is_capped_at_ten_seconds(capture_factory):
+def test_429_retry_after_is_not_shortened_to_client_backoff_cap(capture_factory):
     responses = iter([(429, {"Retry-After": "3600"}), 202])
     server = capture_factory(responder=lambda request: next(responses))
     sleeps: List[float] = []
     transport = make_transport(server, sleeps=sleeps, max_retries=1)
     transport.send(make_payload())
 
-    assert sleeps == [10.0]
+    assert sleeps == [3600.0]
 
 
 def test_parse_retry_after_variants():
@@ -136,6 +139,7 @@ def test_parse_retry_after_variants():
     assert parse_retry_after({}) is None
     assert parse_retry_after(None) is None
     assert parse_retry_after({"Retry-After": "soon"}) is None
+    assert parse_retry_after({"Retry-After": "1.5"}) is None
     # A date in the past clamps to zero instead of going negative.
     past = formatdate(time.time() - 60, usegmt=True)
     assert parse_retry_after({"Retry-After": past}) == 0.0
@@ -231,3 +235,64 @@ def test_corrupt_persistence_file_fails_initialization(tmp_path):
         assert "Invalid Alitycs persistence file" in str(error)
     else:  # pragma: no cover - assertion guard
         raise AssertionError("corrupt persistence state must fail initialization")
+
+
+def test_terminal_recovery_acknowledges_and_continues(capture_factory, tmp_path):
+    state_file = tmp_path / "alitycs-wal.json"
+    store = FileBatchStore(str(state_file))
+    store.put("batch_rejected", b'{"batchId":"batch_rejected"}', 1)
+    store.put("batch_healthy", b'{"batchId":"batch_healthy"}', 1)
+    responses = iter([400, 202])
+    server = capture_factory(responder=lambda request: next(responses))
+    transport = make_transport(server, max_retries=0, persistence_path=str(state_file))
+
+    assert transport.recover() is True
+    assert len(server.requests) == 2
+    assert transport.durable_pending_events == 0
+
+
+def test_fork_reset_detaches_child_without_removing_parent_wal(capture_factory, tmp_path):
+    state_file = tmp_path / "alitycs-wal.json"
+    server = capture_factory(fail_on=(1,))
+    transport = make_transport(server, max_retries=0, persistence_path=str(state_file))
+    assert isinstance(transport.send(make_payload("parent")), SendFailed)
+
+    transport.reset_for_child()
+
+    assert transport.durable_enabled is False
+    assert transport.durable_pending_events == 0
+    assert state_file.exists()
+
+
+def test_store_rolls_back_memory_when_persist_fails(monkeypatch, tmp_path):
+    store = FileBatchStore(str(tmp_path / "alitycs-wal.json"))
+
+    def fail() -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store, "_persist", fail)
+    with pytest.raises(OSError, match="disk full"):
+        store.put("batch_new", b"{}", 3)
+    assert store.pending_events == 0
+
+
+def test_store_pending_event_limit_bounds_wal_growth(tmp_path):
+    store = FileBatchStore(str(tmp_path / "alitycs-wal.json"), max_pending_events=2)
+    store.put("batch_first", b"{}", 2)
+    with pytest.raises(ValueError, match="event limit"):
+        store.put("batch_overflow", b"{}", 1)
+    assert store.pending_events == 2
+
+
+def test_store_rejects_invalid_or_oversized_persistence_limit(tmp_path):
+    with pytest.raises(ValueError, match="positive"):
+        FileBatchStore(None, max_pending_events=0)
+
+    state_file = tmp_path / "alitycs-wal.json"
+    state_file.write_text(
+        '{"version":1,"batches":[{"batch_id":"batch","body":"{}",'
+        '"event_count":2,"paused_until":null}]}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Invalid Alitycs persistence file"):
+        FileBatchStore(str(state_file), max_pending_events=1)

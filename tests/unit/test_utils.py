@@ -128,6 +128,11 @@ def test_validate_event_rejects_events_over_the_size_estimate():
         validate_event(_make_event(properties={"big": "v" * (64 * 1024)}))
 
 
+def test_validate_event_size_counts_utf8_bytes_not_code_points():
+    with pytest.raises(EventRejectedError, match="maximum allowed size"):
+        validate_event(_make_event(event="😀" * 17_000))
+
+
 def test_validate_event_accumulates_violations():
     with pytest.raises(EventRejectedError) as excinfo:
         validate_event(

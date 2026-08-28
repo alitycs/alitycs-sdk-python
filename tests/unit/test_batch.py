@@ -362,16 +362,37 @@ def test_flush_reports_false_until_everything_is_delivered():
     manager.shutdown()
 
 
-def test_reset_for_child_preserves_queue_and_forgets_worker():
+def test_reset_for_child_drops_parent_owned_queue_and_forgets_worker():
     sent = SentBatches()
     manager = make_manager(sent, flush_size=100)
     manager.add(make_event("inherited"))
     manager.reset_for_child()
     assert manager._thread is None
-    assert manager.pending == 1  # queued events survive into the child
+    assert manager.pending == 0
 
     assert manager.flush(timeout=5)
-    assert sent.event_names == ["inherited"]
+    assert sent.event_names == []
+    manager.shutdown()
+
+
+def test_batch_rejection_split_is_bounded_to_sixty_four_sends():
+    sent = []
+
+    def reject(payload: BatchPayload):
+        sent.append(payload)
+        return SendRejected(400)
+
+    manager = BatchManager(
+        flush_size=100,
+        flush_interval=None,
+        max_queue_size=100,
+        send_fn=reject,
+    )
+    for index in range(100):
+        manager.add(make_event(str(index)))
+    assert manager.flush(timeout=5) is False
+    assert len(sent) == 64
+    assert manager.lost_total == 100
     manager.shutdown()
 
 
