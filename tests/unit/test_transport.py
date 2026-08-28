@@ -380,6 +380,20 @@ def test_store_rolls_back_memory_when_persist_fails(monkeypatch, tmp_path):
     assert store.pending_events == 0
 
 
+@pytest.mark.parametrize("paused_until", [float("nan"), float("inf"), float("-inf")])
+def test_store_rejects_non_finite_pause_without_mutating_wal(tmp_path, paused_until):
+    state_file = tmp_path / "alitycs-wal.json"
+    store = FileBatchStore(str(state_file))
+    store.put("batch", b"{}", 1)
+    original = state_file.read_bytes()
+
+    with pytest.raises(ValueError, match="finite"):
+        store.pause("batch", paused_until)
+
+    assert store.snapshot()[0]["paused_until"] is None
+    assert state_file.read_bytes() == original
+
+
 def test_store_pending_event_limit_bounds_wal_growth(tmp_path):
     store = FileBatchStore(str(tmp_path / "alitycs-wal.json"), max_pending_events=2)
     store.put("batch_first", b"{}", 2)

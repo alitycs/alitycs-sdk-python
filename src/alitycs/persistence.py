@@ -137,13 +137,20 @@ class FileBatchStore:
                 raise
 
     def pause(self, batch_id: str, paused_until: Optional[float]) -> None:
+        if paused_until is not None and (
+            not isinstance(paused_until, (int, float))
+            or isinstance(paused_until, bool)
+            or not math.isfinite(float(paused_until))
+        ):
+            raise ValueError("Alitycs persistence pause must be a finite number or None")
+        normalized_pause = None if paused_until is None else float(paused_until)
         with self._lock:
             if self._path is None:
                 return
             record = self._records.get(batch_id)
             if record is not None:
                 previous = self._copy_records()
-                record["paused_until"] = paused_until
+                record["paused_until"] = normalized_pause
                 try:
                     self._persist()
                 except Exception:
