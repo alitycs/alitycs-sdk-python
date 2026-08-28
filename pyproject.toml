@@ -33,7 +33,7 @@ Issues = "https://github.com/alitycs/alitycs-sdk-python/issues"
 
 [project.optional-dependencies]
 dev = [
-    "build==1.3.0",
+    "build==1.5.0",
     "editables==0.5",
     "hatchling==1.27.0",
     "pytest==8.4.2",
