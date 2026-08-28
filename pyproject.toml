@@ -37,7 +37,7 @@ dev = [
     "editables==0.5",
     "hatchling==1.27.0",
     "pytest==8.4.2",
-    "pytest-cov==6.3.0",
+    "pytest-cov==7.1.0",
     "ruff==0.12.3",
 ]
 
