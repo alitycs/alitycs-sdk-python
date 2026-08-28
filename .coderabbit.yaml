@@ -1,0 +1,137 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+tone_instructions: >-
+  Be concise, specific, and constructive. Prioritize defects affecting correctness, security,
+  compatibility, operability, or maintainability. Avoid stylistic comments already enforced by
+  repository tooling and do not repeat findings.
+early_access: false
+enable_free_tier: true
+
+reviews:
+  profile: chill
+  request_changes_workflow: true
+  high_level_summary: true
+  high_level_summary_in_walkthrough: true
+  high_level_summary_instructions: >-
+    Summarize behavioral impact, compatibility risk, security implications, and validation.
+  poem: false
+  in_progress_fortune: false
+  review_status: true
+  review_progress: true
+  fail_commit_status: true
+  changed_files_summary: true
+  collapse_walkthrough: false
+  sequence_diagrams: false
+  suggested_labels: false
+  suggested_reviewers: false
+  auto_apply_labels: false
+  auto_assign_reviewers: false
+  assess_linked_issues: false
+  related_issues: false
+  related_prs: false
+  enable_prompt_for_ai_agents: false
+
+  path_instructions:
+    - path: "**/*"
+      instructions: >-
+        Review for correctness, security, backward compatibility, and sufficient focused tests.
+        Flag undocumented user-visible behavior and dependency or workflow changes that weaken
+        reproducibility, least privilege, or supply-chain safety. GitHub Actions and reusable
+        workflows must use full immutable commit SHAs. Docker actions and workflow images must
+        use immutable SHA-256 digests. Reject YAML merge keys in workflow or action metadata.
+    - path: "src/**/*.py"
+      instructions: >-
+        Preserve the public Python API, Python 3.9 compatibility, thread and signal safety, bounded
+        queues, and honest flush and shutdown outcomes. The SDK sends batches only to the worker
+        POST /events endpoint with a publishable key. Preserve event IDs, identity, and the
+        original timestamp across retries and persisted replay.
+    - path: "tests/**/*.py"
+      instructions: >-
+        Require deterministic coverage for behavioral changes, including wire serialization,
+        retry identity, batching boundaries, thread and lifecycle concurrency, and failures.
+        Contract changes must also be represented in the shared SDK conformance suite.
+    - path: "pyproject.toml"
+      instructions: >-
+        Preserve Python 3.9 compatibility, zero runtime dependencies, reproducible build metadata,
+        and exact release-version alignment. Reject unbounded build requirements.
+    - path: ".coderabbit.yaml"
+      instructions: >-
+        Block changes that disable automatic or incremental review, request-changes behavior,
+        review progress, fail-closed review errors, or latest pull-request head coverage by the
+        native CodeRabbit status. Do not add bot exclusions. Require pinned-schema validation;
+        CODEOWNER approval is the trust boundary and no custom gate application is used.
+    - path: ".github/CODEOWNERS"
+      instructions: >-
+        Keep policy, workflows, validation scripts, and ownership assigned to active maintainers.
+    - path: ".github/workflows/release.yml"
+      instructions: >-
+        Do not add an Actions concurrency key. Preserve annotated immutable release tags, the
+        fresh pre-publication tag identity recheck, and least-privilege publication jobs.
+    - path: ".github/workflows/**"
+      instructions: >-
+        Keep permissions least-privileged and action references immutable. Require exactly one
+        scalar versioned GitHub-hosted runs-on label for non-reusable jobs; reject moving latest
+        labels, mutable workflow images, duplicate keys, and YAML merge keys.
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 0
+    drafts: false
+
+  pre_merge_checks:
+    override_requested_reviewers_only: true
+    docstrings:
+      mode: "off"
+    title:
+      mode: warning
+      requirements: Use a concise, imperative title that describes the behavior changed.
+    description:
+      mode: warning
+    issue_assessment:
+      mode: warning
+
+  tools:
+    github-checks:
+      enabled: true
+
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+    simplify:
+      enabled: false
+    autofix:
+      enabled: false
+    fix_ci:
+      enabled: false
+    resolve_merge_conflict:
+      enabled: false
+    custom: []
+
+  post_merge_actions: []
+
+chat:
+  allow_non_org_members: false
+  art: false
+  auto_reply: true
+
+knowledge_base:
+  opt_out: true
+  web_search:
+    enabled: false
+  automatic_repository_linking: false
+  linked_repositories: []
+
+issue_enrichment:
+  auto_enrich:
+    enabled: false
+  planning:
+    enabled: false
+    auto_planning:
+      enabled: false
+      labels: []
+  labeling:
+    labeling_instructions: []
+    auto_apply_labels: false
