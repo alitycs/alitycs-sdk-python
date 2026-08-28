@@ -215,6 +215,29 @@ def each_document_merge_key(stream, &block)
   end
 end
 
+def each_duplicate_mapping_key(node, context, &block)
+  if node.is_a?(Psych::Nodes::Mapping)
+    seen = Set.new
+    node.children.each_slice(2) do |key, value|
+      name = scalar_value(key, context)
+      block.call(name, node_location(key)) if !name.nil? && !seen.add?(name)
+      each_duplicate_mapping_key(key, context, &block)
+      each_duplicate_mapping_key(value, context, &block)
+    end
+  elsif node.respond_to?(:children) && node.children
+    node.children.each { |child| each_duplicate_mapping_key(child, context, &block) }
+  end
+end
+
+def each_document_duplicate_mapping_key(stream, &block)
+  stream.children.each do |document|
+    context = document_context(document)
+    document.children.each do |root|
+      each_duplicate_mapping_key(root, context, &block)
+    end
+  end
+end
+
 def each_workflow_container_image(job, context)
   mapping_values(job, "container", context).each do |container_key, container|
     resolved_container = resolve_alias(container, context)
@@ -392,6 +415,9 @@ begin
       each_document_merge_key(stream) do |location|
         errors << "#{path}: #{location} YAML merge keys (<<) are not supported"
       end
+      each_document_duplicate_mapping_key(stream) do |name, location|
+        errors << "#{path}: #{location} duplicate YAML mapping key #{name.inspect}"
+      end
       each_action_uses(stream, path) do |reference, location, reference_kind|
         if reference_kind == :workflow_jobs_missing
           errors << "#{path}: #{location} workflow must declare exactly one jobs mapping"
@@ -482,6 +508,8 @@ begin
       end
     rescue Psych::Exception => error
       errors << "#{path}: invalid YAML: #{error.message.lines.first&.strip}"
+    rescue StandardError => error
+      errors << "#{path}: validation failed: #{error.class}: #{error.message}"
     end
   end
 

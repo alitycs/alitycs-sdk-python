@@ -89,6 +89,8 @@ jobs:
         with:
           name: release-artifacts
           path: release/
+      - name: Verify artifact checksums
+        run: (cd release && sha256sum --check --strict SHA256SUMS)
       - name: Recheck immutable release tag
         env:
           EXPECTED_TAG_COMMIT: ${{ needs.build.outputs.tag_commit }}
@@ -123,6 +125,8 @@ jobs:
         with:
           name: release-artifacts
           path: dist/
+      - name: Verify artifact checksums
+        run: (cd dist && sha256sum --check --strict SHA256SUMS)
       - name: Remove checksum manifest
         run: rm dist/SHA256SUMS
       - name: Publish package
