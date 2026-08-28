@@ -104,10 +104,13 @@ verify_step = build_steps&.find { |step| step.is_a?(Hash) && step["id"] == "veri
 recheck_step = release_steps&.find do |step|
   step.is_a?(Hash) && step["name"] == "Recheck immutable release tag"
 end
+create_step = release_steps&.find { |step| step.is_a?(Hash) && step["name"] == "Create GitHub Release" }
 verify_run = verify_step.is_a?(Hash) ? verify_step["run"].to_s : ""
 recheck_run = recheck_step.is_a?(Hash) ? recheck_step["run"].to_s : ""
+create_run = create_step.is_a?(Hash) ? create_step["run"].to_s : ""
 verify_lines = shell_lines.call(verify_run)
 recheck_lines = shell_lines.call(recheck_run)
+create_lines = shell_lines.call(create_run)
 tag_guard = 'if [[ "$(git cat-file -t "$GITHUB_REF")" != "tag" ]]; then'
 guard_start = verify_lines.index(tag_guard)
 guard_end = guard_start && verify_lines.each_index.find { |index| index > guard_start && verify_lines[index] == "fi" }
@@ -120,12 +123,19 @@ unless guard_fails &&
     verify_lines.include?('[[ "$tag_commit" == "$GITHUB_SHA" ]]')
   failures << "release must require annotated tags"
 end
-unless recheck_lines.include?(
-  '[[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{tag}")" == "$EXPECTED_TAG_OBJECT" ]]',
-) && recheck_lines.include?(
-  '[[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")" == "$EXPECTED_TAG_COMMIT" ]]',
-) && recheck_lines.include?('[[ "$GITHUB_SHA" == "$EXPECTED_TAG_COMMIT" ]]')
+tag_identity_rechecked = lambda do |lines|
+  lines.include?(
+    '[[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{tag}")" == "$EXPECTED_TAG_OBJECT" ]]',
+  ) && lines.include?(
+    '[[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")" == "$EXPECTED_TAG_COMMIT" ]]',
+  ) && lines.include?('[[ "$GITHUB_SHA" == "$EXPECTED_TAG_COMMIT" ]]')
+end
+unless tag_identity_rechecked.call(recheck_lines)
   failures << "release must recheck immutable tag"
+end
+unless tag_identity_rechecked.call(create_lines) &&
+    create_lines.include?('gh release create "$GITHUB_REF_NAME" release/* --verify-tag --generate-notes')
+  failures << "release must recheck immutable tag immediately before creation"
 end
 failures << "release workflow must not use concurrency" if release_data.key?("concurrency")
 

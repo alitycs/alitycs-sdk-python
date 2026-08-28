@@ -107,7 +107,14 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" release/* --verify-tag --generate-notes
+          EXPECTED_TAG_COMMIT: ${{ needs.build.outputs.tag_commit }}
+          EXPECTED_TAG_OBJECT: ${{ needs.build.outputs.tag_object }}
+        run: |
+          git fetch --force origin "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          [[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{tag}")" == "$EXPECTED_TAG_OBJECT" ]]
+          [[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")" == "$EXPECTED_TAG_COMMIT" ]]
+          [[ "$GITHUB_SHA" == "$EXPECTED_TAG_COMMIT" ]]
+          gh release create "$GITHUB_REF_NAME" release/* --verify-tag --generate-notes
 
   publish-pypi:
     name: Publish to PyPI

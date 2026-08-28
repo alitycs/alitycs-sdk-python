@@ -6,8 +6,8 @@
 3. Merge after CI and CodeRabbit review.
 4. Create and push an annotated tag matching the package version.
 5. The release workflow verifies reviewed `main`, builds the wheel and source distribution,
-   rechecks immutable tag identity, attests the artifacts, creates the GitHub Release, and
-   publishes to PyPI using trusted publishing.
+   rechecks immutable tag identity before attestation and again immediately before creating the
+   GitHub Release, then publishes to PyPI using trusted publishing.
 
 The active `Immutable release tags` ruleset matches `refs/tags/v*`, blocks tag updates and
 deletions, and has no bypass actors.
